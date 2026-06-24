@@ -254,6 +254,12 @@ def _metadata_bias_score(
     for key, value in bias.items():
         if not value:
             continue
+        if key == "label":
+            # Gmail labels are scored independently by _label_match_score
+            # and weighted by W_LABEL_MATCH -- they must NOT be folded
+            # into the channel/user bias magnitude (which is weighted by
+            # W_CHANNEL_MATCH in hybrid). Skip here.
+            continue
         if key == "user":
             # Slack: card["user"] is the user_name. Gmail: the sender
             # lives in from_name OR from_email (we accept either). Any
@@ -287,6 +293,86 @@ def _subject_keyword_hits(source_card: Dict[str, Any], terms: List[str]) -> int:
     if not isinstance(subject, str) or not subject:
         return 0
     return count_keyword_hits(subject, terms)
+
+
+# --- Gmail label vocabulary + inference ------------------------------------
+# Maps natural-language label words to Gmail's canonical label IDs. Only
+# Gmail SYSTEM labels are inferable from words, because the ingestion path
+# stores label IDs (not user-label display names) on the document. User
+# labels (opaque "Label_<n>" ids) therefore can't be matched by name -- a
+# known limitation, but the system tabs below cover the common asks.
+_GMAIL_LABEL_VOCAB: Tuple[Tuple[str, str], ...] = (
+    ("inbox", "INBOX"),
+    ("starred", "STARRED"),
+    ("important", "IMPORTANT"),
+    ("unread", "UNREAD"),
+    ("sent", "SENT"),
+    ("drafts", "DRAFT"),
+    ("draft", "DRAFT"),
+    ("promotions", "CATEGORY_PROMOTIONS"),
+    ("promotion", "CATEGORY_PROMOTIONS"),
+    ("updates", "CATEGORY_UPDATES"),
+    ("social", "CATEGORY_SOCIAL"),
+    ("forums", "CATEGORY_FORUMS"),
+    ("forum", "CATEGORY_FORUMS"),
+    ("spam", "SPAM"),
+    ("trash", "TRASH"),
+)
+
+# A label is only inferred when the question is clearly email-scoped, so
+# generic words ("an important decision", "social media") don't trigger a
+# label bias. One of these tokens must be present.
+_EMAIL_CONTEXT_RE = re.compile(r"\b(e-?mails?|mails?|inbox|gmail|messages?|msgs?)\b", re.IGNORECASE)
+
+
+def infer_gmail_label(question: str) -> Optional[str]:
+    """
+    Infer a Gmail SYSTEM label id from a natural-language question, or
+    None when no confident label is implied.
+
+    Conservative by design: returns a label only when (a) the question
+    carries an email-context token (email/mail/inbox/message/gmail) AND
+    (b) it mentions a known label word. This keeps "important emails" ->
+    IMPORTANT while leaving "an important question" untouched. The result
+    feeds metadata_bias["label"], a ranking-only signal (W_LABEL_MATCH) --
+    it never hard-filters, so a rare false positive only nudges order.
+
+    Pure and side-effect-free, like the rest of this module.
+    """
+    if not question:
+        return None
+    q = question.lower()
+    if not _EMAIL_CONTEXT_RE.search(q):
+        return None
+    for phrase, label_id in _GMAIL_LABEL_VOCAB:
+        if re.search(r"\b" + re.escape(phrase) + r"\b", q):
+            return label_id
+    return None
+
+
+def _label_match_score(source_card: Dict[str, Any], bias: Optional[Dict[str, str]]) -> int:
+    """
+    1 when the card's Gmail labels contain the biased label id, else 0.
+
+    `bias["label"]` is a single Gmail label id (e.g. "INBOX",
+    "CATEGORY_PROMOTIONS"). The card's `labels` is the list[str] of label
+    ids harvested from the email document header. Comparison is
+    case-insensitive. Slack cards (no `labels`) always score 0, so this
+    signal is inert outside Gmail.
+    """
+    if not bias:
+        return 0
+    wanted = bias.get("label")
+    if not wanted or not isinstance(wanted, str):
+        return 0
+    labels = source_card.get("labels")
+    if not isinstance(labels, list):
+        return 0
+    target = wanted.strip().lower()
+    for lid in labels:
+        if isinstance(lid, str) and lid.strip().lower() == target:
+            return 1
+    return 0
 
 
 def rerank_chunks(
@@ -342,14 +428,17 @@ def rerank_chunks(
         hits = count_keyword_hits(chunk.get("text", ""), terms)
         subj_hits = _subject_keyword_hits(card, terms)
         bias = _metadata_bias_score(card, metadata_bias)
+        label_bias = _label_match_score(card, metadata_bias)
         ts = chunk.get("timestamp_float") or 0.0
         chunk["_hits"] = hits
         chunk["_subject_hits"] = subj_hits
         chunk["_bias"] = bias
+        chunk["_label_bias"] = label_bias
         chunk["_debug_score"] = {
             "keyword_hits": hits,
             "subject_hits": subj_hits,
             "metadata_bias": bias,
+            "label_match": label_bias,
             "timestamp": ts,
             "normalized_recency": (ts / max_ts) if max_ts else 0.0,
         }
@@ -367,6 +456,7 @@ def rerank_chunks(
                     -c["_hits"],
                     -c["_subject_hits"],
                     -c["_bias"],
+                    -c["_label_bias"],
                     -(c.get("timestamp_float") or 0.0),
                     c["original_index"],
                 ),
@@ -378,6 +468,7 @@ def rerank_chunks(
             chunks_with_meta,
             key=lambda c: (
                 -c["_bias"],
+                -c["_label_bias"],
                 c["original_index"],
             ),
         )
@@ -393,6 +484,7 @@ def rerank_chunks(
                 c["_hits"] * W_KEYWORD_HIT
                 + c["_subject_hits"] * W_SUBJECT_HIT
                 + c["_bias"] * W_CHANNEL_MATCH  # generic bias-magnitude
+                + c["_label_bias"] * W_LABEL_MATCH
                 + (ts / max_ts) * W_RECENCY
             )
 
@@ -412,6 +504,7 @@ def rerank_chunks(
         chunks_with_meta,
         key=lambda c: (
             -c["_bias"],
+            -c["_label_bias"],
             c["original_index"],
         ),
     )

@@ -964,28 +964,72 @@ _TRAILER_CUT_RES = (
     re.compile(r"this (?:e-?mail|message) is intended (?:only |solely )?for", re.IGNORECASE),
 )
 
+# Phase B retrieval-noise patterns. Conservative: each targets lines that
+# are almost always boilerplate/tracking rather than sentence content, so
+# the real message survives.
+_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff\u00ad]")
+_VIEW_IN_BROWSER_RES = (
+    re.compile(
+        r"^view (?:this )?(?:e-?mail|message|newsletter)?\s*(?:in (?:your )?browser|online)\b.*",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^having trouble (?:reading|viewing|seeing) this(?: e-?mail| message)?\b.*", re.IGNORECASE),
+    re.compile(r"^can'?t see (?:this|the) (?:e-?mail|message|images)\b.*", re.IGNORECASE),
+)
+# A line made up only of decorative separators (===, ---, ***, • • •, ...).
+# Requires >=3 chars so the RFC-3676 "--" signature delimiter (handled
+# separately) is never caught here.
+_SEPARATOR_LINE_RE = re.compile(r"^[\s\-_=*~•·—–.]{3,}$")
+_IMAGE_PLACEHOLDER_RE = re.compile(r"^\[(?:image|cid|logo)\b[^\]]*\]$", re.IGNORECASE)
+# A line that is essentially nothing but a single URL (optionally
+# angle-bracketed). Only dropped when it ALSO carries tracking markers, so
+# plain content links survive.
+_URL_ONLY_LINE_RE = re.compile(r"^<?https?://\S+>?$", re.IGNORECASE)
+_TRACKING_MARKERS_RE = re.compile(
+    r"(?:utm_[a-z]+=|/wf/click|/wf/open|list-manage\.com|mailchi(?:mp)?\.|sendgrid\.|sparkpostmail|mailgun|"
+    r"cmail\d|exct\.net|/CL0/|click\.|/track(?:ing)?[/?]|/redirect[/?]|beacon|/open\.aspx|/pixel)",
+    re.IGNORECASE,
+)
+
 
 def _clean_email_text(text: str) -> str:
     """
-    Trim trailing boilerplate from an email body while preserving the
-    real content.
+    Trim trailing boilerplate AND inline retrieval noise from an email
+    body while preserving the real content.
 
-    Removes, in order:
+    Removed, in order:
+      0. Zero-width / soft-hyphen characters (globally) -- invisible
+         artifacts that fragment tokens and hurt recall.
       1. RFC 3676 signature blocks (a line that is exactly "--"), cut to
          the end. Never cuts at the very first line.
       2. Unsubscribe / legal-disclaimer trailers, cut to the end -- but
          only when the marker appears in the latter half of the message,
          so a newsletter whose header carries an unsubscribe link isn't
          wiped out.
-      3. Mobile footers ("Sent from my iPhone", "Get Outlook for iOS",
-         ...) and any stray boilerplate lines, removed line-by-line.
+      3. Line-by-line noise: mobile footers, stray unsubscribe/legal
+         lines, "view in browser" / "having trouble viewing" lines,
+         decorative separator rules, "[image: ...]" placeholders, and
+         standalone URL lines carrying tracking markers (utm_, click
+         trackers, list-manage, ...). Plain content URLs are KEPT.
 
-    Safety net: if cleanup would empty a non-empty body, the original
-    text is returned unchanged. Never raises.
+    Conservative throughout: only lines that are almost always boilerplate
+    are dropped; sentence-bearing lines are preserved. A safety net
+    returns the original text if cleanup would empty a non-empty body.
+    Never raises.
+
+    The email document HEADER block (Subject/From/Date/Labels/...) is built
+    separately by build_email_document and is NOT touched here, so recall
+    header-harvesting and memory extraction see the same contract as before.
     """
     if not text or not text.strip():
         return text or ""
+
+    # 0. Drop invisible characters before any line analysis.
+    text = _ZERO_WIDTH_RE.sub("", text)
     original_stripped = text.strip()
+    if not original_stripped:
+        return ""
+
     lines = text.split("\n")
     n = len(lines)
 
@@ -1006,7 +1050,7 @@ def _clean_email_text(text: str) -> str:
                     break
                 # Too early to be a trailer; line-removal (below) handles it.
 
-    # 3. Line-level removal of mobile footers + any remaining boilerplate.
+    # 3. Line-level removal of boilerplate + tracking noise.
     kept: List[str] = []
     for ln in lines:
         s = ln.strip()
@@ -1016,6 +1060,14 @@ def _clean_email_text(text: str) -> str:
         if any(rx.match(s) for rx in _MOBILE_FOOTER_RES):
             continue
         if any(rx.search(s) for rx in _TRAILER_CUT_RES):
+            continue
+        if any(rx.match(s) for rx in _VIEW_IN_BROWSER_RES):
+            continue
+        if _SEPARATOR_LINE_RE.match(s):
+            continue
+        if _IMAGE_PLACEHOLDER_RE.match(s):
+            continue
+        if _URL_ONLY_LINE_RE.match(s) and _TRACKING_MARKERS_RE.search(s):
             continue
         kept.append(ln)
 

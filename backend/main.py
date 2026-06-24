@@ -528,6 +528,18 @@ def _resolve_query_rewrite(req: QueryRequest) -> Dict[str, Any]:
     elif rewrite["inferred_person"] and rewrite["person_confidence"] == "weak" and not (req.user and req.user.strip()):
         bias["user"] = rewrite["inferred_person"]
 
+    # Phase B: Gmail label inference. Deterministic word->label-id mapping,
+    # gated on an email-scoped question (see search_utils.infer_gmail_label).
+    # It adds a ranking-only bias (W_LABEL_MATCH) and NEVER a hard filter,
+    # so it can't drop results; it's independent of the person/channel
+    # rewriter above. Folded into metadata_bias so it flows through both
+    # query routes and the cache key uniformly.
+    from search_utils import infer_gmail_label  # noqa: PLC0415
+
+    inferred_label = infer_gmail_label(req.question)
+    if inferred_label:
+        bias["label"] = inferred_label
+
     rewrite_debug = None
     if rewrite["inferred_person"] or rewrite["inferred_channel"]:
         # Only attach the debug record when we actually inferred something —
