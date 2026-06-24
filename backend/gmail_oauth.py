@@ -69,6 +69,35 @@ def _max_messages_per_run() -> int:
 
 
 # ---------------------------------------------------------------------- #
+# Attachment ingestion caps (Phase C). All env-tunable. These bound the
+# extra Gmail API calls, memory, and per-document size that attachment
+# extraction can introduce, so the scheduler stays stable.
+# ---------------------------------------------------------------------- #
+def _max_attachments_per_email() -> int:
+    """Max attachments we extract per email (excess are skipped)."""
+    try:
+        return max(0, int(os.getenv("GMAIL_MAX_ATTACHMENTS_PER_EMAIL", "10")))
+    except ValueError:
+        return 10
+
+
+def _attachment_max_chars() -> int:
+    """Per-attachment cap on extracted characters."""
+    try:
+        return max(1, int(os.getenv("GMAIL_ATTACHMENT_MAX_CHARS", "20000")))
+    except ValueError:
+        return 20_000
+
+
+def _attachment_total_max_chars() -> int:
+    """Cap on combined extracted attachment text per email document."""
+    try:
+        return max(1, int(os.getenv("GMAIL_ATTACHMENT_TOTAL_MAX_CHARS", "64000")))
+    except ValueError:
+        return 64_000
+
+
+# ---------------------------------------------------------------------- #
 # Env access (helpers wrapped so tests can monkeypatch fresh values)
 # ---------------------------------------------------------------------- #
 
@@ -830,6 +859,40 @@ def fetch_message(
     return data
 
 
+def fetch_attachment_data(
+    connection: Dict[str, Any],
+    message_id: str,
+    attachment_id: str,
+) -> Optional[str]:
+    """
+    Fetch a single attachment's bytes (as the base64url `data` string
+    Gmail returns) via users.messages.attachments.get. Used only for
+    large attachments whose bytes don't arrive inline on the full
+    message. Returns None on any permanent failure -- the caller treats
+    that as "skip this attachment".
+
+    Inherits the 401-refresh + 429-retry behavior of _authed_request and
+    requires no new OAuth scope (gmail.readonly covers attachments.get).
+    """
+    if not message_id or not attachment_id:
+        return None
+    try:
+        data, _conn = _authed_request(
+            "GET",
+            f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}/attachments/{attachment_id}",
+            connection,
+        )
+    except GmailApiError as e:
+        logger.warning(
+            "gmail_fetch_attachment_failed",
+            extra={"message_id": message_id, "error": str(e)},
+        )
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data.get("data") or None
+
+
 # ---------------------------------------------------------------------- #
 # Message -> Markdown
 # ---------------------------------------------------------------------- #
@@ -876,6 +939,10 @@ def _find_part_text(payload: Dict[str, Any], wanted_mime: str) -> str:
     """
     Depth-first search for the first body data with mimeType == `wanted_mime`.
     Returns the decoded text, or "" if no such part exists.
+
+    Parts that carry a non-empty `filename` are ATTACHMENTS, not the
+    message body -- they're handled by the attachment pipeline, so we
+    never let a (e.g.) text/plain .txt attachment masquerade as the body.
     """
     if not isinstance(payload, dict):
         return ""
@@ -883,8 +950,9 @@ def _find_part_text(payload: Dict[str, Any], wanted_mime: str) -> str:
     mime = (payload.get("mimeType") or "").lower()
     body = payload.get("body") or {}
     data = body.get("data") or ""
+    is_attachment = bool((payload.get("filename") or "").strip())
 
-    if mime == wanted_mime and data:
+    if mime == wanted_mime and data and not is_attachment:
         return _decode_b64url(data)
 
     for child in payload.get("parts") or []:
@@ -1132,18 +1200,201 @@ def _truncate(s: str, max_len: int) -> str:
     return s[: max_len - 1].rstrip() + "…"
 
 
+def _collect_attachment_parts(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Walk a Gmail message payload tree and return the SUPPORTED attachment
+    parts as a list of:
+
+        {"filename", "mime_type", "size", "attachment_id"|None, "inline_data"|None}
+
+    A part is an attachment iff it carries a non-empty `filename`.
+    Unsupported types (by is_supported_attachment) are skipped here so
+    the caller never even fetches their bytes.
+    """
+    from gmail_attachments import is_supported_attachment  # noqa: PLC0415
+
+    out: List[Dict[str, Any]] = []
+
+    def _walk(node: Any) -> None:
+        if not isinstance(node, dict):
+            return
+        filename = (node.get("filename") or "").strip()
+        if filename:
+            mime = (node.get("mimeType") or "").strip()
+            if is_supported_attachment(filename, mime):
+                body = node.get("body") or {}
+                try:
+                    size = int(body.get("size") or 0)
+                except (TypeError, ValueError):
+                    size = 0
+                out.append(
+                    {
+                        "filename": filename,
+                        "mime_type": mime,
+                        "size": size,
+                        "attachment_id": (body.get("attachmentId") or "").strip() or None,
+                        "inline_data": body.get("data") or None,
+                    }
+                )
+        for child in node.get("parts") or []:
+            _walk(child)
+
+    _walk(payload)
+    return out
+
+
+def gather_attachment_sections(
+    connection: Dict[str, Any],
+    message: Dict[str, Any],
+    summary: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """
+    Extract text from a message's supported attachments and return a list
+    of section dicts:
+
+        [{"filename", "mime_type", "size", "chars", "text"}, ...]
+
+    Best-effort and bounded:
+      - Skips unsupported types and anything over the per-attachment byte
+        cap (avoids loading huge blobs into memory).
+      - Caps the number of attachments per email and the total extracted
+        characters per email document.
+      - A failure on ONE attachment (fetch error, corrupt file, empty
+        extraction) is logged + counted and never aborts the others or
+        the message.
+
+    Updates `summary` counters: attachments_processed / attachments_failed
+    / attachments_skipped. Privacy: logs only mime type, size, and the
+    message id -- never the filename or extracted text.
+    """
+    from gmail_attachments import extract_text_from_attachment, max_attachment_bytes  # noqa: PLC0415
+
+    sections: List[Dict[str, Any]] = []
+    if not isinstance(message, dict):
+        return sections
+    message_id = (message.get("id") or "").strip()
+    payload = message.get("payload") or {}
+    parts = _collect_attachment_parts(payload)
+    if not parts:
+        return sections
+
+    max_count = _max_attachments_per_email()
+    if max_count <= 0:
+        return sections
+    max_bytes = max_attachment_bytes()
+    per_cap = _attachment_max_chars()
+    total_cap = _attachment_total_max_chars()
+    used_chars = 0
+    seen_keys: set = set()
+
+    for part in parts:
+        if len(sections) >= max_count:
+            summary["attachments_skipped"] += 1
+            continue
+
+        # Dedupe within the email (same attachment can appear twice in
+        # oddly-structured multiparts).
+        dedupe_key = part.get("attachment_id") or part.get("filename")
+        if dedupe_key in seen_keys:
+            continue
+        seen_keys.add(dedupe_key)
+
+        size = part.get("size") or 0
+        if size and size > max_bytes:
+            summary["attachments_skipped"] += 1
+            logger.info(
+                "gmail_attachment_too_large",
+                extra={"message_id": message_id, "mime_type": part.get("mime_type"), "size": size},
+            )
+            continue
+
+        # Obtain bytes: inline data if present (no extra API call), else
+        # fetch by attachment id.
+        try:
+            b64 = part.get("inline_data")
+            if not b64 and part.get("attachment_id"):
+                b64 = fetch_attachment_data(connection, message_id, part["attachment_id"])
+            if not b64:
+                summary["attachments_failed"] += 1
+                continue
+            raw = base64.urlsafe_b64decode(b64 + "=" * (-len(b64) % 4))
+        except Exception:  # noqa: BLE001
+            summary["attachments_failed"] += 1
+            logger.warning(
+                "gmail_attachment_fetch_failed",
+                extra={"message_id": message_id, "mime_type": part.get("mime_type"), "size": size},
+            )
+            continue
+
+        if len(raw) > max_bytes:
+            summary["attachments_skipped"] += 1
+            logger.info(
+                "gmail_attachment_too_large",
+                extra={"message_id": message_id, "mime_type": part.get("mime_type"), "size": len(raw)},
+            )
+            continue
+
+        try:
+            text = extract_text_from_attachment(part["filename"], part["mime_type"], raw)
+        except Exception:  # noqa: BLE001
+            text = None
+        if not text or not text.strip():
+            summary["attachments_failed"] += 1
+            logger.warning(
+                "gmail_attachment_extract_failed",
+                extra={"message_id": message_id, "mime_type": part.get("mime_type"), "size": size},
+            )
+            continue
+
+        text = text.strip()
+        if len(text) > per_cap:
+            text = text[:per_cap]
+        # Enforce the per-email total budget.
+        remaining_budget = total_cap - used_chars
+        if remaining_budget <= 0:
+            summary["attachments_skipped"] += 1
+            continue
+        if len(text) > remaining_budget:
+            text = text[:remaining_budget]
+        used_chars += len(text)
+
+        sections.append(
+            {
+                "filename": part["filename"],
+                "mime_type": part.get("mime_type") or "",
+                "size": size,
+                "chars": len(text),
+                "text": text,
+            }
+        )
+        summary["attachments_processed"] += 1
+
+    return sections
+
+
 def build_email_document(
     message: Dict[str, Any],
     connection_email: str,
+    attachments: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Convert a Gmail message dict into the {filename, content, stable_key,
     ...} shape HydraDBClient.upload_knowledge expects. Returns None when
-    the message has no usable text (e.g. an empty receipt that's just
-    images).
+    the message has no usable text (no body, no snippet, AND no
+    extracted attachment text).
 
-    DOES NOT log any header values or body text -- only counts / IDs
-    flow into logs from here.
+    Phase C: extracted attachment text (from `attachments`, produced by
+    gather_attachment_sections) is appended to the SAME document under an
+    "## Attachments" section, after the email body. This keeps one
+    HydraDB document per email -- so document_type stays "email", the
+    stable_key stays gmail:msg:<id>, recall/ranking/source-card/recency
+    are unchanged, deletion sync removes attachments with their parent,
+    and memory extraction sees attachment text associated with the email.
+
+    `attachments` is an optional list of section dicts:
+        {"filename", "mime_type", "size", "chars", "text"}
+
+    DOES NOT log any header values, body text, or attachment text.
     """
     if not isinstance(message, dict):
         return None
@@ -1151,6 +1402,7 @@ def build_email_document(
     if not message_id:
         return None
 
+    attachments = attachments or []
     payload = message.get("payload") or {}
     headers = payload.get("headers") or []
     subject = _header_value(headers, "Subject") or "(no subject)"
@@ -1162,7 +1414,8 @@ def build_email_document(
     label_ids = message.get("labelIds") or []
     body_text = _extract_text_from_payload(payload).strip()
 
-    if not body_text and not snippet:
+    has_attachment_text = any((a.get("text") or "").strip() for a in attachments)
+    if not body_text and not snippet and not has_attachment_text:
         # Nothing to index; skip silently.
         return None
 
@@ -1196,7 +1449,42 @@ def build_email_document(
     # Cap the body at 32k chars. Real emails rarely exceed this; if one
     # does we'd rather index a meaningful prefix than refuse the doc.
     body_for_doc = _truncate(body_text or snippet, 32_000)
-    content = "\n".join(header_lines + ["", body_for_doc])
+    content_lines = header_lines + ["", body_for_doc]
+
+    # Append extracted attachment text. The section markers use "##"/"###"
+    # and an "Attachment:" label that deliberately does NOT collide with
+    # the recall header field names (Subject:/From:/Date:/Labels:/
+    # Permalink:), and "## Attachments" is not the "# Email" doc header --
+    # so header harvesting (which matches the FIRST occurrence at the top)
+    # is unaffected.
+    attachment_meta: List[Dict[str, Any]] = []
+    if attachments:
+        rendered = []
+        for a in attachments:
+            text = (a.get("text") or "").strip()
+            if not text:
+                continue
+            name = a.get("filename") or "attachment"
+            mime = a.get("mime_type") or ""
+            size = a.get("size") or 0
+            rendered.append(f"### Attachment: {name} ({mime}, {size} bytes)")
+            rendered.append(text)
+            rendered.append("")
+            attachment_meta.append(
+                {
+                    "filename": name,
+                    "mime_type": mime,
+                    "size": size,
+                    "chars": len(text),
+                }
+            )
+        if rendered:
+            content_lines.append("")
+            content_lines.append("## Attachments")
+            content_lines.append("")
+            content_lines.extend(rendered)
+
+    content = "\n".join(content_lines)
 
     filename = f"gmail_{_safe_filename_part(message_id)}.md"
     return {
@@ -1210,6 +1498,9 @@ def build_email_document(
         "document_type": "email",
         "snippet": _truncate(snippet, 280),
         "permalink": permalink,
+        # Attachment provenance (counts + types + sizes only; no text).
+        # Observability metadata -- recall ignores unknown doc keys.
+        "attachments": attachment_meta,
     }
 
 
@@ -1368,6 +1659,9 @@ def run_workspace_gmail_ingest(
         "messages_failed": 0,
         "messages_skipped": 0,
         "messages_deleted": 0,
+        "attachments_processed": 0,
+        "attachments_failed": 0,
+        "attachments_skipped": 0,
         # Phase 11 observability fields.
         "sync_mode_requested": sync_mode,
         "sync_started_at": started_at.isoformat(),
@@ -1627,7 +1921,23 @@ def run_workspace_gmail_ingest(
             if not msg:
                 summary["messages_failed"] += 1
                 continue
-            doc = build_email_document(msg, connection_email)
+            # Phase C: extract supported attachments for this message.
+            # Best-effort and fully bounded; a gather failure degrades to
+            # "no attachments" and never aborts the message.
+            try:
+                attachment_sections = gather_attachment_sections(connection, msg, summary)
+            except Exception as e:  # noqa: BLE001
+                attachment_sections = []
+                logger.warning(
+                    "gmail_attachments_gather_failed",
+                    extra={
+                        "workspace_id": workspace_id,
+                        "connection_id": connection_id,
+                        "label_id": label_id,
+                        "error": type(e).__name__,
+                    },
+                )
+            doc = build_email_document(msg, connection_email, attachments=attachment_sections)
             if doc is None:
                 summary["messages_skipped"] += 1
                 continue
@@ -1777,6 +2087,7 @@ def run_workspace_gmail_ingest(
             "messages_uploaded": summary["messages_uploaded"],
             "messages_failed": summary["messages_failed"],
             "messages_deleted": summary["messages_deleted"],
+            "attachments_processed": summary["attachments_processed"],
             "incremental_label_count": summary["incremental_label_count"],
             "full_label_count": summary["full_label_count"],
             "invalidations": summary["invalidations"],
@@ -1802,6 +2113,8 @@ def run_workspace_gmail_ingest(
                 "messages_uploaded": summary["messages_uploaded"],
                 "messages_failed": summary["messages_failed"],
                 "messages_deleted": summary["messages_deleted"],
+                "attachments_processed": summary["attachments_processed"],
+                "attachments_failed": summary["attachments_failed"],
                 "incremental_label_count": summary["incremental_label_count"],
                 "full_label_count": summary["full_label_count"],
                 "invalidations": summary["invalidations"],
