@@ -212,16 +212,29 @@ def exchange_code(code: str) -> Optional[Dict[str, Any]]:
     return data
 
 
-def refresh_access_token(refresh_token: str) -> Optional[Dict[str, Any]]:
+def _refresh_access_token_detailed(
+    refresh_token: str,
+) -> Tuple[Optional[Dict[str, Any]], str]:
     """
-    Exchange a refresh_token for a fresh access_token.
+    Exchange a refresh_token for a fresh access_token AND classify the
+    outcome so callers can react to a revoked grant vs. a transient
+    failure.
 
-    Returns the parsed response (which contains a new `access_token`
-    and an `expires_in`) or None on failure. Google does NOT re-issue
-    a refresh_token here -- the caller keeps the existing one.
+    Returns a (data, outcome) tuple where:
+        outcome == "ok"        -> data is the parsed token response
+        outcome == "revoked"   -> the grant is permanently invalid
+                                  (Google `invalid_grant`, 401/403, or a
+                                  missing refresh_token). The user must
+                                  reconnect.
+        outcome == "transient" -> a temporary failure (network, 429, 5xx,
+                                  non-JSON, or an unexpected 400). A later
+                                  run may succeed.
+
+    Never raises, never logs tokens.
     """
     if not refresh_token:
-        return None
+        # Nothing to refresh with -> the only fix is a reconnect.
+        return None, "revoked"
     try:
         resp = requests.post(
             "https://oauth2.googleapis.com/token",
@@ -238,18 +251,111 @@ def refresh_access_token(refresh_token: str) -> Optional[Dict[str, Any]]:
             "gmail_oauth_refresh_request_failed",
             extra={"error": type(e).__name__},
         )
-        return None
+        return None, "transient"
 
+    status = resp.status_code
+    if status == 400:
+        # Google signals a revoked / expired / mismatched grant with a
+        # 400 + {"error": "invalid_grant"}. Other 400s (e.g.
+        # invalid_request) are treated as transient so a config blip
+        # doesn't permanently mark a connection dead.
+        error_code = ""
+        try:
+            body = resp.json()
+            if isinstance(body, dict):
+                error_code = (body.get("error") or "").strip().lower()
+        except ValueError:
+            error_code = ""
+        if error_code == "invalid_grant":
+            logger.warning("gmail_oauth_refresh_invalid_grant")
+            return None, "revoked"
+        logger.warning(
+            "gmail_oauth_refresh_http_error",
+            extra={"status": status},
+        )
+        return None, "transient"
+    if status in (401, 403):
+        # An unauthorized refresh almost always means the grant or the
+        # client authorization is gone. Treat as revoked.
+        logger.warning(
+            "gmail_oauth_refresh_unauthorized",
+            extra={"status": status},
+        )
+        return None, "revoked"
+    if status == 429 or 500 <= status < 600:
+        logger.warning(
+            "gmail_oauth_refresh_http_error",
+            extra={"status": status},
+        )
+        return None, "transient"
     if not resp.ok:
         logger.warning(
             "gmail_oauth_refresh_http_error",
-            extra={"status": resp.status_code},
+            extra={"status": status},
         )
-        return None
+        return None, "transient"
     try:
-        return resp.json()
+        data = resp.json()
     except ValueError:
-        return None
+        return None, "transient"
+    if not isinstance(data, dict) or "access_token" not in data:
+        logger.warning("gmail_oauth_refresh_missing_token")
+        return None, "transient"
+    return data, "ok"
+
+
+def refresh_access_token(refresh_token: str) -> Optional[Dict[str, Any]]:
+    """
+    Exchange a refresh_token for a fresh access_token.
+
+    Returns the parsed response (which contains a new `access_token`
+    and an `expires_in`) or None on failure. Google does NOT re-issue
+    a refresh_token here -- the caller keeps the existing one.
+
+    Thin, backwards-compatible wrapper over
+    `_refresh_access_token_detailed`. Callers that need to react to a
+    revoked grant (e.g. _authed_request) use the detailed helper via
+    `_refresh_and_mark`.
+    """
+    data, _outcome = _refresh_access_token_detailed(refresh_token)
+    return data
+
+
+def revoke_token(token: str) -> bool:
+    """
+    Best-effort revocation of a Google OAuth token (access or refresh).
+
+    Called when a user disconnects a Gmail account so the stored grant
+    can't be reused. Revoking a refresh_token also invalidates the
+    access tokens derived from it.
+
+    Never raises. Returns True when Google confirms the token is no
+    longer valid (HTTP 200), or when Google reports it was already
+    invalid (HTTP 400) -- both mean "the grant is gone", which is the
+    caller's goal. Returns False on network errors or unexpected status.
+    """
+    if not token:
+        return False
+    try:
+        resp = requests.post(
+            "https://oauth2.googleapis.com/revoke",
+            data={"token": token},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        logger.warning(
+            "gmail_token_revoke_request_failed",
+            extra={"error": type(e).__name__},
+        )
+        return False
+    if resp.status_code in (200, 400):
+        return True
+    logger.warning(
+        "gmail_token_revoke_http_error",
+        extra={"status": resp.status_code},
+    )
+    return False
 
 
 def fetch_user_info(access_token: str) -> Optional[Dict[str, Any]]:
@@ -327,6 +433,76 @@ class GmailApiError(Exception):
     """Raised by helpers when Gmail returns a permanent error."""
 
 
+def _mark_connection_status(connection: Dict[str, Any], status: str) -> None:
+    """
+    Persist gmail_connections.status when it changes, and mirror the new
+    value onto the in-memory connection dict.
+
+    Best-effort and idempotent:
+      - If the in-memory status already equals `status`, this is a no-op
+        (no DB write) -- so a healthy connection that refreshes its
+        access token never incurs a status write.
+      - Workspace-scoped: we pass BOTH the connection id and workspace_id
+        to the writer so a status flip can never touch another
+        workspace's row.
+      - NEVER raises. A status-write failure must not mask the Gmail
+        error that triggered it; we only update the in-memory value when
+        the write actually succeeded, so a failed write is retried on the
+        next call within the same run.
+    """
+    try:
+        if (connection.get("status") or "") == status:
+            return
+        connection_id = (connection.get("id") or "").strip()
+        workspace_id = (connection.get("workspace_id") or "").strip()
+        if not connection_id or not workspace_id:
+            # No identifiers to scope a write (e.g. a bare test stub).
+            # Keep the in-memory value consistent for callers.
+            connection["status"] = status
+            return
+        from supabase_client import set_gmail_connection_status  # noqa: PLC0415
+
+        ok = set_gmail_connection_status(
+            connection_id=connection_id,
+            workspace_id=workspace_id,
+            status=status,
+        )
+        if ok:
+            connection["status"] = status
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "gmail_status_mark_failed",
+            extra={"status": status, "error": type(e).__name__},
+        )
+
+
+def _refresh_and_mark(connection: Dict[str, Any]) -> str:
+    """
+    Refresh the access token for `connection`, updating the in-memory
+    dict and the persisted connection status, then return the new
+    access token.
+
+    On success: stamps `_token_refreshed=True` (so the ingest runner
+    persists the token once at end-of-run) and restores status to
+    'active' if it had drifted (recovery-on-refresh).
+
+    On failure: persists status 'revoked' (permanent / invalid_grant)
+    or 'error' (transient) and raises GmailApiError so the existing
+    control flow (retry layer + dead-letter) is unchanged.
+    """
+    data, outcome = _refresh_access_token_detailed(connection.get("refresh_token") or "")
+    if outcome == "ok" and data and "access_token" in data:
+        connection["access_token"] = data["access_token"]
+        connection["_token_refreshed"] = True
+        _mark_connection_status(connection, "active")
+        return data["access_token"]
+    if outcome == "revoked":
+        _mark_connection_status(connection, "revoked")
+        raise GmailApiError("Gmail authorization revoked (refresh failed).")
+    _mark_connection_status(connection, "error")
+    raise GmailApiError("Gmail token refresh failed (transient).")
+
+
 def _authed_request(
     method: str,
     url: str,
@@ -353,13 +529,11 @@ def _authed_request(
     """
     access_token = (connection.get("access_token") or "").strip()
     if not access_token:
-        # No usable access token in memory; try to mint one before the call.
-        refreshed = refresh_access_token(connection.get("refresh_token") or "")
-        if not refreshed or "access_token" not in refreshed:
-            raise GmailApiError("Could not obtain Gmail access token.")
-        access_token = refreshed["access_token"]
-        connection["access_token"] = access_token
-        connection["_token_refreshed"] = True
+        # No usable access token in memory; mint one before the call.
+        # _refresh_and_mark classifies a revoked grant vs. a transient
+        # failure, persists the connection status accordingly, and
+        # raises GmailApiError on failure.
+        access_token = _refresh_and_mark(connection)
 
     headers = {"Authorization": f"Bearer {access_token}"}
     try:
@@ -374,13 +548,9 @@ def _authed_request(
         raise GmailApiError(f"Gmail HTTP failed: {type(e).__name__}")
 
     if resp.status_code == 401:
-        # Refresh and retry exactly once.
-        refreshed = refresh_access_token(connection.get("refresh_token") or "")
-        if not refreshed or "access_token" not in refreshed:
-            raise GmailApiError("Gmail refresh failed (401).")
-        access_token = refreshed["access_token"]
-        connection["access_token"] = access_token
-        connection["_token_refreshed"] = True
+        # Refresh and retry exactly once. _refresh_and_mark persists the
+        # revoked/error status and raises GmailApiError on failure.
+        access_token = _refresh_and_mark(connection)
         headers = {"Authorization": f"Bearer {access_token}"}
         try:
             resp = requests.request(
@@ -524,31 +694,47 @@ def list_history_message_ids(
     Pull the delta since `start_history_id` and return:
 
         {
-          "message_ids":      List[str],   # deduped, capped at max_results
-          "next_history_id":  str|None,    # the new high-water mark
-          "invalidated":      bool,        # True iff Gmail returned 404
+          "message_ids":         List[str],  # added, deduped, capped at max_results
+          "deleted_message_ids": List[str],  # permanently-deleted, deduped (uncapped)
+          "next_history_id":     str|None,   # the new high-water mark
+          "invalidated":         bool,       # True iff Gmail returned 404
         }
 
     `label_id` narrows the delta to one label so the runner can
     process labels independently.
 
-    `invalidated`: Gmail garbage-collects history records after about
-    a week. A `last_history_id` older than that returns 404; we surface
-    that via the `invalidated` flag so the runner can fall back to a
-    full sync and reset the watermark.
+    We request BOTH messageAdded and messageDeleted history types so the
+    runner can ingest new mail AND remove permanently-deleted mail from
+    HydraDB in the same incremental pass (`requests` encodes a list value
+    as repeated `historyTypes=` query params, which Gmail accepts). A
+    message id that appears in BOTH within the same window is treated as
+    deleted (it is removed from `message_ids`) so we never ingest
+    something the user just deleted.
+
+    `invalidated`: Gmail garbage-collects history records after about a
+    week. A `last_history_id` older than that returns 404; we surface
+    that via the `invalidated` flag so the runner can fall back to a full
+    sync and reset the watermark.
     """
     if not start_history_id:
-        return {"message_ids": [], "next_history_id": None, "invalidated": False}
+        return {
+            "message_ids": [],
+            "deleted_message_ids": [],
+            "next_history_id": None,
+            "invalidated": False,
+        }
 
     out_ids: List[str] = []
+    deleted_ids: List[str] = []
     last_seen_history_id: Optional[str] = None
     page_token: Optional[str] = None
     seen: set = set()
+    deleted_seen: set = set()
 
     while len(out_ids) < max_results:
         params: Dict[str, Any] = {
             "startHistoryId": str(start_history_id),
-            "historyTypes": "messageAdded",
+            "historyTypes": ["messageAdded", "messageDeleted"],
             "maxResults": min(500, max_results - len(out_ids)),
         }
         if label_id:
@@ -571,6 +757,7 @@ def list_history_message_ids(
             if "HTTP 404" in msg:
                 return {
                     "message_ids": [],
+                    "deleted_message_ids": [],
                     "next_history_id": None,
                     "invalidated": True,
                 }
@@ -590,8 +777,15 @@ def list_history_message_ids(
                 if mid and mid not in seen:
                     seen.add(mid)
                     out_ids.append(mid)
-                    if len(out_ids) >= max_results:
-                        break
+            # Deletions are collected separately and are NOT bounded by
+            # the added-message cap -- cleanup should be complete for the
+            # pages we scan.
+            for removed in entry.get("messagesDeleted") or []:
+                m = removed.get("message") or {}
+                mid = (m.get("id") or "").strip()
+                if mid and mid not in deleted_seen:
+                    deleted_seen.add(mid)
+                    deleted_ids.append(mid)
             if len(out_ids) >= max_results:
                 break
 
@@ -599,8 +793,14 @@ def list_history_message_ids(
         if not page_token:
             break
 
+    # If a message was added and then deleted within the same window,
+    # the deletion wins -- don't ingest something the user removed.
+    if deleted_seen:
+        out_ids = [mid for mid in out_ids if mid not in deleted_seen]
+
     return {
         "message_ids": out_ids[:max_results],
+        "deleted_message_ids": deleted_ids,
         "next_history_id": last_seen_history_id,
         "invalidated": False,
     }
@@ -647,10 +847,13 @@ def _decode_b64url(s: str) -> str:
 
 def _extract_text_from_payload(payload: Dict[str, Any]) -> str:
     """
-    Walk a Gmail message payload tree and return the first text/plain
-    body we find. If only text/html is present anywhere in the tree,
-    strip the HTML tags minimally so the recall pipeline gets readable
-    text.
+    Walk a Gmail message payload tree and return readable body text.
+
+    A text/plain part wins over a text/html sibling; when only HTML is
+    present we strip it to text. In both cases the result is passed
+    through _clean_email_text, which trims signatures, mobile footers,
+    unsubscribe blocks, and legal disclaimers while preserving the real
+    message body.
 
     Two passes through the tree so a text/plain part wins over a
     text/html sibling regardless of which appears first. Real
@@ -662,10 +865,10 @@ def _extract_text_from_payload(payload: Dict[str, Any]) -> str:
 
     plain = _find_part_text(payload, "text/plain")
     if plain:
-        return plain
+        return _clean_email_text(plain)
     html_text = _find_part_text(payload, "text/html")
     if html_text:
-        return _strip_html(html_text)
+        return _clean_email_text(_strip_html(html_text))
     return ""
 
 
@@ -691,17 +894,137 @@ def _find_part_text(payload: Dict[str, Any], wanted_mime: str) -> str:
     return ""
 
 
+_SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+_BLOCK_TAG_RE = re.compile(
+    r"</?\s*(?:br|p|div|tr|li|ul|ol|h[1-6]|table|blockquote|hr|header|footer|section|article)\b[^>]*>",
+    re.IGNORECASE,
+)
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
-_WHITESPACE_RE = re.compile(r"\s+")
+_INLINE_WS_RE = re.compile(r"[ \t\f\v]+")
+_MULTI_NL_RE = re.compile(r"\n{2,}")
 
 
 def _strip_html(raw_html: str) -> str:
-    """Remove tags, decode entities, collapse whitespace. Very basic."""
+    """
+    Convert an HTML email body to readable plain text.
+
+    Improved over the original tags->space collapse: we drop
+    script/style blocks entirely, turn structural tags (br, p, div, tr,
+    li, headings, hr, ...) into newlines so paragraph and list
+    boundaries survive, strip the remaining inline tags, decode HTML
+    entities, then collapse runs of intra-line whitespace WITHOUT
+    destroying the line breaks. Preserving newlines is what lets
+    _clean_email_text detect signature delimiters and trailing
+    boilerplate.
+    """
     if not raw_html:
         return ""
-    no_tags = _HTML_TAG_RE.sub(" ", raw_html)
-    decoded = html.unescape(no_tags)
-    return _WHITESPACE_RE.sub(" ", decoded).strip()
+    s = _SCRIPT_STYLE_RE.sub(" ", raw_html)
+    s = _BLOCK_TAG_RE.sub("\n", s)
+    s = _HTML_TAG_RE.sub(" ", s)
+    s = html.unescape(s)
+    # Collapse spaces/tabs within lines but keep newlines.
+    s = _INLINE_WS_RE.sub(" ", s)
+    # Trim each line, then collapse runs of blank lines.
+    lines = [ln.strip() for ln in s.split("\n")]
+    s = "\n".join(lines)
+    s = _MULTI_NL_RE.sub("\n", s)
+    return s.strip()
+
+
+# --- Email body cleanup: signatures, mobile footers, unsubscribe & legal ---
+# Conservative by design: we PRESERVE real content. Cleanup either cuts
+# from a recognized trailer to the end (only when the trailer sits in the
+# latter half of the message, so a newsletter's top-of-body unsubscribe
+# link doesn't nuke everything) or removes individual boilerplate lines.
+# A final safety net returns the original text if cleanup somehow emptied
+# it.
+_SIG_DELIM_RE = re.compile(r"^--\s*$")
+
+_MOBILE_FOOTER_RES = (
+    re.compile(r"^sent from my\b.*", re.IGNORECASE),
+    re.compile(r"^sent from (?:mail|outlook|yahoo|proton ?mail|gmail|samsung)\b.*", re.IGNORECASE),
+    re.compile(r"^get outlook for\b.*", re.IGNORECASE),
+    re.compile(r"^sent (?:via|from) .+ (?:app|for (?:ios|android))\b.*", re.IGNORECASE),
+    re.compile(r"^download .+ (?:app|for (?:ios|android))\b.*", re.IGNORECASE),
+)
+
+_TRAILER_CUT_RES = (
+    re.compile(r"\bunsubscribe\b", re.IGNORECASE),
+    re.compile(r"you (?:are )?receiv(?:e|ed|ing) this (?:email|message)", re.IGNORECASE),
+    re.compile(r"to (?:stop receiving|opt[\s-]?out)", re.IGNORECASE),
+    re.compile(r"manage your (?:email )?(?:preferences|subscription|notifications)", re.IGNORECASE),
+    re.compile(r"update your (?:email )?(?:preferences|subscription)", re.IGNORECASE),
+    re.compile(
+        r"this (?:e-?mail|message)(?: and any attachments)? (?:is|are|may be) (?:confidential|intended)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"confidentiality notice", re.IGNORECASE),
+    re.compile(r"if you are not the intended recipient", re.IGNORECASE),
+    re.compile(r"this (?:e-?mail|message) is intended (?:only |solely )?for", re.IGNORECASE),
+)
+
+
+def _clean_email_text(text: str) -> str:
+    """
+    Trim trailing boilerplate from an email body while preserving the
+    real content.
+
+    Removes, in order:
+      1. RFC 3676 signature blocks (a line that is exactly "--"), cut to
+         the end. Never cuts at the very first line.
+      2. Unsubscribe / legal-disclaimer trailers, cut to the end -- but
+         only when the marker appears in the latter half of the message,
+         so a newsletter whose header carries an unsubscribe link isn't
+         wiped out.
+      3. Mobile footers ("Sent from my iPhone", "Get Outlook for iOS",
+         ...) and any stray boilerplate lines, removed line-by-line.
+
+    Safety net: if cleanup would empty a non-empty body, the original
+    text is returned unchanged. Never raises.
+    """
+    if not text or not text.strip():
+        return text or ""
+    original_stripped = text.strip()
+    lines = text.split("\n")
+    n = len(lines)
+
+    # 1. Signature delimiter -> cut to end (never at line 0).
+    for i in range(1, n):
+        if _SIG_DELIM_RE.match(lines[i].strip()):
+            lines = lines[:i]
+            break
+    n = len(lines)
+
+    # 2. Trailer block (unsubscribe / legal) -> cut to end, but only when
+    #    the marker is in the latter half so top-of-body links survive.
+    if n >= 4:
+        for i in range(1, n):
+            if any(rx.search(lines[i]) for rx in _TRAILER_CUT_RES):
+                if i >= (n // 2):
+                    lines = lines[:i]
+                    break
+                # Too early to be a trailer; line-removal (below) handles it.
+
+    # 3. Line-level removal of mobile footers + any remaining boilerplate.
+    kept: List[str] = []
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            kept.append(ln)
+            continue
+        if any(rx.match(s) for rx in _MOBILE_FOOTER_RES):
+            continue
+        if any(rx.search(s) for rx in _TRAILER_CUT_RES):
+            continue
+        kept.append(ln)
+
+    cleaned = "\n".join(kept)
+    cleaned = _MULTI_NL_RE.sub("\n", cleaned).strip()
+
+    if not cleaned:
+        return original_stripped
+    return cleaned
 
 
 def _header_value(headers: List[Dict[str, str]], name: str) -> str:
@@ -846,6 +1169,86 @@ def build_email_document(
 # lifting happens in the worker. Mirrors slack_oauth.run_workspace_ingest.
 
 
+def _process_gmail_deletions(
+    *,
+    hydra: Any,
+    workspace_id: str,
+    connection_id: Optional[str],
+    label_id: str,
+    deleted_message_ids: List[str],
+    summary: Dict[str, Any],
+) -> None:
+    """
+    Remove permanently-deleted Gmail messages from HydraDB and clear
+    their derived memories.
+
+    Both steps are best-effort: a failure here logs and continues so a
+    cleanup problem never blocks ingestion of the (separately handled)
+    added messages, and never raises into the runner.
+
+    Deletion is keyed by the per-message stable key
+    (`gmail:msg:<id>`) -- the same `Source Key:` we stamp into every
+    email document's markdown header.
+    """
+    keys: List[str] = []
+    for mid in deleted_message_ids or []:
+        mid = (mid or "").strip()
+        if mid:
+            keys.append(stable_key_for_gmail_message(mid))
+    if not keys:
+        return
+
+    # 1. Remove the documents from HydraDB (batched, best-effort).
+    try:
+        hydra.delete_knowledge(keys)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "gmail_hydra_delete_failed",
+            extra={
+                "workspace_id": workspace_id,
+                "connection_id": connection_id,
+                "label_id": label_id,
+                "key_count": len(keys),
+                "error": type(e).__name__,
+            },
+        )
+
+    # 2. Clear derived memories for each deleted source (best-effort).
+    try:
+        from memory_store import delete_memories_by_source  # noqa: PLC0415
+
+        for key in keys:
+            try:
+                delete_memories_by_source(
+                    workspace_id=workspace_id,
+                    source_stable_key=key,
+                )
+            except Exception:  # noqa: BLE001
+                # Per-key failure must not stop the rest of the cleanup.
+                pass
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "gmail_memory_delete_failed",
+            extra={
+                "workspace_id": workspace_id,
+                "connection_id": connection_id,
+                "label_id": label_id,
+                "error": type(e).__name__,
+            },
+        )
+
+    summary["messages_deleted"] += len(keys)
+    logger.info(
+        "gmail_messages_deleted",
+        extra={
+            "workspace_id": workspace_id,
+            "connection_id": connection_id,
+            "label_id": label_id,
+            "count": len(keys),
+        },
+    )
+
+
 def run_workspace_gmail_ingest(
     *,
     workspace_id: str,
@@ -912,6 +1315,7 @@ def run_workspace_gmail_ingest(
         "messages_uploaded": 0,
         "messages_failed": 0,
         "messages_skipped": 0,
+        "messages_deleted": 0,
         # Phase 11 observability fields.
         "sync_mode_requested": sync_mode,
         "sync_started_at": started_at.isoformat(),
@@ -1082,6 +1486,22 @@ def run_workspace_gmail_ingest(
                 message_ids = hist_result.get("message_ids") or []
                 new_history_id = hist_result.get("next_history_id")
                 effective_label_mode = "incremental"
+
+                # Deleted-email sync: remove permanently-deleted messages
+                # from HydraDB and clear their derived memories. Runs only
+                # on the incremental path (full listing carries no
+                # deletion signal) and never blocks the added-message
+                # ingestion below.
+                deleted_ids = hist_result.get("deleted_message_ids") or []
+                if deleted_ids:
+                    _process_gmail_deletions(
+                        hydra=hydra,
+                        workspace_id=workspace_id,
+                        connection_id=connection_id,
+                        label_id=label_id,
+                        deleted_message_ids=deleted_ids,
+                        summary=summary,
+                    )
 
         if not use_incremental:
             # Full listing path. Same as Phase 8 behavior.
@@ -1304,6 +1724,7 @@ def run_workspace_gmail_ingest(
             "labels_failed": summary["labels_failed"],
             "messages_uploaded": summary["messages_uploaded"],
             "messages_failed": summary["messages_failed"],
+            "messages_deleted": summary["messages_deleted"],
             "incremental_label_count": summary["incremental_label_count"],
             "full_label_count": summary["full_label_count"],
             "invalidations": summary["invalidations"],
@@ -1328,6 +1749,7 @@ def run_workspace_gmail_ingest(
                 "labels_failed": summary["labels_failed"],
                 "messages_uploaded": summary["messages_uploaded"],
                 "messages_failed": summary["messages_failed"],
+                "messages_deleted": summary["messages_deleted"],
                 "incremental_label_count": summary["incremental_label_count"],
                 "full_label_count": summary["full_label_count"],
                 "invalidations": summary["invalidations"],

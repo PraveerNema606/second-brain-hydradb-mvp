@@ -228,6 +228,23 @@ export default function GmailSettings() {
   const connected = connections.length > 0;
   const busy = saving || ingesting || removing;
 
+  // Phase: connection health. The backend sets gmail_connections.status
+  // to 'revoked' (grant gone -- user must reconnect) or 'error'
+  // (transient) when a token refresh fails at the _authed_request
+  // chokepoint; 'active' otherwise. We surface it per-connection so one
+  // broken mailbox never mislabels a healthy one.
+  const activeStatus = (activeConn?.status || "active").toLowerCase();
+  const statusBadge = useMemo(() => {
+    switch (activeStatus) {
+      case "revoked":
+        return { label: "Access revoked", kind: "error" };
+      case "error":
+        return { label: "Connection error", kind: "error" };
+      default:
+        return null;
+    }
+  }, [activeStatus]);
+
   // Phase 11: render a "Last synced X ago" hint per active connection.
   // The data comes from the enriched /api/gmail/connections response;
   // we never make a separate fetch for this. Falls back to "Never
@@ -258,8 +275,40 @@ export default function GmailSettings() {
               </span>
             </>
           )}
+          {connected && statusBadge && (
+            <>
+              {" "}
+              <span
+                className={`slack-settings__tag slack-settings__tag--${statusBadge.kind}`}
+              >
+                {statusBadge.label}
+              </span>
+            </>
+          )}
         </span>
       </div>
+
+      {connected && statusBadge && (
+        <p className="slack-settings__error" role="alert">
+          {activeStatus === "revoked"
+            ? "Google revoked access to this mailbox (or it expired). Syncing is paused until you reconnect."
+            : "We hit an error refreshing this connection. We'll retry automatically; if it persists, reconnect the account."}
+          {activeStatus === "revoked" && (
+            <>
+              {" "}
+              <button
+                type="button"
+                className="btn btn--ghost"
+                onClick={handleConnect}
+                disabled={busy}
+                title="Reconnect this Gmail account"
+              >
+                Reconnect
+              </button>
+            </>
+          )}
+        </p>
+      )}
 
       {info && (
         <p
