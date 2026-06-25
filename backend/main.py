@@ -82,17 +82,17 @@ from errors import AppError, app_error_handler  # noqa: E402
 # clash with the Slack helpers above (both modules expose
 # build_connect_url, exchange_code, verify_oauth_state, etc.).
 from gmail_oauth import build_connect_url as gmail_build_connect_url  # noqa: E402
-from gmail_oauth import exchange_code as gmail_exchange_code
-from gmail_oauth import fetch_user_info as gmail_fetch_user_info
-from gmail_oauth import (
+from gmail_oauth import exchange_code as gmail_exchange_code  # noqa: E402
+from gmail_oauth import fetch_user_info as gmail_fetch_user_info  # noqa: E402
+from gmail_oauth import (  # noqa: E402
     gmail_oauth_configured,
 )
-from gmail_oauth import installation_from_token_response as gmail_installation_from_token_response
-from gmail_oauth import list_labels as list_gmail_labels_from_api
-from gmail_oauth import (
+from gmail_oauth import installation_from_token_response as gmail_installation_from_token_response  # noqa: E402
+from gmail_oauth import list_labels as list_gmail_labels_from_api  # noqa: E402
+from gmail_oauth import (  # noqa: E402
     run_workspace_gmail_ingest,
 )
-from gmail_oauth import verify_oauth_state as verify_gmail_oauth_state
+from gmail_oauth import verify_oauth_state as verify_gmail_oauth_state  # noqa: E402
 from health import router as health_router  # noqa: E402
 from llm import stream_grounded_answer  # noqa: E402
 from logging_config import configure_logging, get_logger  # noqa: E402

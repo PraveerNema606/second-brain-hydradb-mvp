@@ -2157,7 +2157,7 @@ def run_workspace_gmail_ingest(
     """
     import time as _time  # noqa: PLC0415
 
-    from hydradb_client import HydraDBClient, summarize_upload_response  # noqa: PLC0415
+    from hydradb_client import HydraDBClient  # noqa: PLC0415
     from supabase_client import (  # noqa: PLC0415
         get_gmail_ingestion_state_map,
         update_gmail_connection_tokens,
@@ -2252,9 +2252,8 @@ def run_workspace_gmail_ingest(
         )
         state_map = {}
 
-    # Seen-this-run sets used to dedupe across labels in one sweep (a
-    # message/thread can carry two labels). Phase D operates per THREAD.
-    seen_message_ids_this_run: set = set()
+    # Seen-this-run set: dedupes threads across labels in one sweep
+    # (a thread can be reachable under more than one label).
     seen_thread_ids_this_run: set = set()
 
     logger.info(
