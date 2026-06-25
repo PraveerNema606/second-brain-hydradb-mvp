@@ -667,6 +667,50 @@ def list_message_ids_for_label(
     return ids[:max_results]
 
 
+def list_thread_ids_for_label(
+    connection: Dict[str, Any],
+    label_id: str,
+    *,
+    max_results: int = 100,
+) -> List[str]:
+    """
+    Return the most recent THREAD ids for a label (Phase D full-sync path).
+
+    messages.list returns {id, threadId} per message; many messages share
+    a thread, so we collect threadIds in recency order and de-duplicate.
+    `max_results` caps the number of distinct threads (the runner treats
+    its per-run budget as a THREAD budget). Honors whatever the caller
+    passes so unit tests can use small numbers.
+    """
+    thread_ids: List[str] = []
+    seen: set = set()
+    page_token: Optional[str] = None
+    while len(thread_ids) < max_results:
+        params: Dict[str, Any] = {
+            "labelIds": label_id,
+            "maxResults": 100,
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        data, _conn = _authed_request(
+            "GET",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+            connection,
+            params=params,
+        )
+        for row in (data or {}).get("messages") or []:
+            tid = (row.get("threadId") or "").strip()
+            if tid and tid not in seen:
+                seen.add(tid)
+                thread_ids.append(tid)
+                if len(thread_ids) >= max_results:
+                    break
+        page_token = (data or {}).get("nextPageToken")
+        if not page_token:
+            break
+    return thread_ids[:max_results]
+
+
 # ---------------------------------------------------------------------- #
 # Incremental sync (Phase 11)
 # ---------------------------------------------------------------------- #
@@ -749,16 +793,22 @@ def list_history_message_ids(
         return {
             "message_ids": [],
             "deleted_message_ids": [],
+            "added_thread_ids": [],
+            "deleted_thread_ids": [],
             "next_history_id": None,
             "invalidated": False,
         }
 
     out_ids: List[str] = []
     deleted_ids: List[str] = []
+    added_thread_ids: List[str] = []
+    deleted_thread_ids: List[str] = []
     last_seen_history_id: Optional[str] = None
     page_token: Optional[str] = None
     seen: set = set()
     deleted_seen: set = set()
+    added_thread_seen: set = set()
+    deleted_thread_seen: set = set()
 
     while len(out_ids) < max_results:
         params: Dict[str, Any] = {
@@ -787,6 +837,8 @@ def list_history_message_ids(
                 return {
                     "message_ids": [],
                     "deleted_message_ids": [],
+                    "added_thread_ids": [],
+                    "deleted_thread_ids": [],
                     "next_history_id": None,
                     "invalidated": True,
                 }
@@ -806,6 +858,10 @@ def list_history_message_ids(
                 if mid and mid not in seen:
                     seen.add(mid)
                     out_ids.append(mid)
+                tid = (m.get("threadId") or "").strip()
+                if tid and tid not in added_thread_seen:
+                    added_thread_seen.add(tid)
+                    added_thread_ids.append(tid)
             # Deletions are collected separately and are NOT bounded by
             # the added-message cap -- cleanup should be complete for the
             # pages we scan.
@@ -815,6 +871,14 @@ def list_history_message_ids(
                 if mid and mid not in deleted_seen:
                     deleted_seen.add(mid)
                     deleted_ids.append(mid)
+                # Gmail history carries threadId on deleted messages too,
+                # so the affected thread is resolvable WITHOUT re-fetching
+                # the (gone) message -- this is what makes thread-keyed
+                # deletion sync possible.
+                tid = (m.get("threadId") or "").strip()
+                if tid and tid not in deleted_thread_seen:
+                    deleted_thread_seen.add(tid)
+                    deleted_thread_ids.append(tid)
             if len(out_ids) >= max_results:
                 break
 
@@ -830,6 +894,8 @@ def list_history_message_ids(
     return {
         "message_ids": out_ids[:max_results],
         "deleted_message_ids": deleted_ids,
+        "added_thread_ids": added_thread_ids,
+        "deleted_thread_ids": deleted_thread_ids,
         "next_history_id": last_seen_history_id,
         "invalidated": False,
     }
@@ -891,6 +957,35 @@ def fetch_attachment_data(
     if not isinstance(data, dict):
         return None
     return data.get("data") or None
+
+
+def fetch_thread(connection: Dict[str, Any], thread_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetch a whole Gmail thread with `format=full` (users.threads.get), so a
+    single call returns every message in the conversation WITH headers +
+    bodies + part structure. Returns the thread dict (with `messages`), or
+    None when the thread no longer exists (HTTP 404 -> fully deleted).
+
+    A 404 is reported as None (a normal "gone" signal the materializer
+    uses to delete the consolidated doc); any other error re-raises as
+    GmailApiError so the retry layer / caller can handle it. Inherits the
+    401-refresh + 429-retry behavior of _authed_request and needs no new
+    OAuth scope (gmail.readonly covers threads.get).
+    """
+    if not thread_id:
+        return None
+    try:
+        data, _conn = _authed_request(
+            "GET",
+            f"https://gmail.googleapis.com/gmail/v1/users/me/threads/{thread_id}",
+            connection,
+            params={"format": "full"},
+        )
+    except GmailApiError as e:
+        if "HTTP 404" in str(e):
+            return None
+        raise
+    return data if isinstance(data, dict) else None
 
 
 # ---------------------------------------------------------------------- #
@@ -1183,8 +1278,43 @@ def stable_key_for_gmail_message(message_id: str) -> str:
     """
     Stable, unique key for HydraDB dedupe. Gmail's `id` is globally
     unique across mailboxes, so we don't need to include workspace_id.
+
+    NOTE: Phase D moved Gmail's primary unit of ingestion to the THREAD
+    (stable_key_for_gmail_thread). This per-message key is retained for
+    (a) the lazy migration that deletes legacy per-message docs when a
+    thread is first materialized, and (b) legacy deletion cleanup.
     """
     return f"gmail:msg:{message_id}"
+
+
+def stable_key_for_gmail_thread(thread_id: str) -> str:
+    """
+    Stable, unique key for a consolidated Gmail THREAD document (Phase D).
+
+    Gmail's threadId is globally unique, so (like the per-message key) we
+    don't fold in workspace_id. The `gmail:` prefix keeps source-kind
+    classification working and `document_type` stays "email", so recall,
+    ranking, recency, and the source-card harvester treat a thread doc
+    exactly like a single-email doc.
+    """
+    return f"gmail:thread:{thread_id}"
+
+
+def _gmail_internal_date_seconds(message: Dict[str, Any]) -> Optional[float]:
+    """Gmail `internalDate` (ms since epoch, as a string) -> unix seconds."""
+    v = message.get("internalDate") if isinstance(message, dict) else None
+    try:
+        return int(v) / 1000.0 if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _thread_max_chars() -> int:
+    """Cap on the combined rendered text of a consolidated thread doc."""
+    try:
+        return max(1, int(os.getenv("GMAIL_THREAD_MAX_CHARS", "48000")))
+    except ValueError:
+        return 48_000
 
 
 def _safe_filename_part(s: str, max_len: int = 40) -> str:
@@ -1505,6 +1635,358 @@ def build_email_document(
 
 
 # ---------------------------------------------------------------------- #
+# Thread-aware document construction (Phase D)
+# ---------------------------------------------------------------------- #
+
+
+def build_email_thread_document(
+    thread_messages: List[Dict[str, Any]],
+    connection_email: str,
+    message_attachments: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Consolidate ALL messages of a Gmail thread into ONE document, mirroring
+    the Slack thread model. Returns the {filename, content, stable_key,
+    ...} dict upload_knowledge expects, or None when the thread has no
+    indexable content.
+
+    The document keeps document_type="email", a "# Email" header, and the
+    Subject/From/Date/Labels/Permalink header lines (from the LATEST
+    message; labels unioned across the thread), plus the gmail: stable-key
+    prefix -- so recall/ranking/source-card/recency treat it exactly like a
+    single-email doc and need NO changes. Each message becomes a
+    "## Message from <sender> on <date>" block in chronological order, with
+    its Phase C attachment sections embedded. The block markers and the
+    additive "Thread:"/"Messages:" header lines deliberately avoid the
+    harvester's field names, and the real header sits FIRST, so header
+    harvesting (first-match-wins) is unaffected.
+
+    `message_attachments` maps message id -> the Phase C attachment section
+    list for that message.
+
+    DOES NOT log any header values, body text, or attachment text.
+    """
+    message_attachments = message_attachments or {}
+    msgs = [m for m in (thread_messages or []) if isinstance(m, dict) and (m.get("id") or "").strip()]
+    if not msgs:
+        return None
+
+    # Chronological order by internalDate (fallback: input order via stable sort).
+    msgs.sort(key=lambda m: (_gmail_internal_date_seconds(m) or 0.0))
+    latest = msgs[-1]
+    thread_id = (latest.get("threadId") or msgs[0].get("threadId") or "").strip()
+    if not thread_id:
+        return None
+
+    latest_payload = latest.get("payload") or {}
+    latest_headers = latest_payload.get("headers") or []
+    subject = _header_value(latest_headers, "Subject") or "(no subject)"
+    sender = _header_value(latest_headers, "From")
+    to = _header_value(latest_headers, "To")
+    date = _header_value(latest_headers, "Date")
+    snippet = (latest.get("snippet") or "").strip()
+
+    # Union labels across the thread (sorted for stable output) so label-
+    # aware ranking (Phase B) matches if ANY message carried the label.
+    label_set: set = set()
+    for m in msgs:
+        for lid in m.get("labelIds") or []:
+            if isinstance(lid, str) and lid.strip():
+                label_set.add(lid.strip())
+    label_ids = sorted(label_set)
+
+    stable_key = stable_key_for_gmail_thread(thread_id)
+    permalink = f"https://mail.google.com/mail/u/0/#all/{thread_id}"
+    latest_message_id = (latest.get("id") or "").strip()
+
+    header_lines = [
+        "# Email",
+        f"Source Key: {stable_key}",
+        f"Thread: {thread_id}",
+        f"Messages: {len(msgs)}",
+        f"Mailbox: {connection_email}",
+        f"Subject: {_truncate(subject, 200)}",
+        f"From: {_truncate(sender, 200)}",
+        f"To: {_truncate(to, 200)}",
+        f"Date: {date}",
+        f"Labels: {', '.join(label_ids)}",
+        f"Snippet: {_truncate(snippet, 280)}",
+        f"Permalink: {permalink}",
+    ]
+
+    total_cap = _thread_max_chars()
+    # Per-message budget with a sensible floor so short threads aren't
+    # over-trimmed; the running total is still hard-capped at total_cap.
+    per_msg_cap = max(2_000, total_cap // max(1, len(msgs)))
+    used = 0
+    body_lines: List[str] = []
+    attachment_meta: List[Dict[str, Any]] = []
+    indexable = False
+
+    for m in msgs:
+        if used >= total_cap:
+            break
+        mp = m.get("payload") or {}
+        mh = mp.get("headers") or []
+        m_from = _header_value(mh, "From") or "(unknown sender)"
+        m_date = _header_value(mh, "Date") or ""
+        m_body = _extract_text_from_payload(mp).strip()
+        m_snippet = (m.get("snippet") or "").strip()
+        block_text = m_body or m_snippet
+        if len(block_text) > per_msg_cap:
+            block_text = _truncate(block_text, per_msg_cap)
+
+        body_lines.append("")
+        body_lines.append(f"## Message from {_truncate(m_from, 200)} on {m_date}".rstrip())
+        if block_text:
+            remaining_total = total_cap - used
+            if len(block_text) > remaining_total:
+                block_text = block_text[:remaining_total]
+            if block_text:
+                body_lines.append(block_text)
+                used += len(block_text)
+                indexable = True
+
+        # Embedded attachments for this message (Phase C format/markers).
+        for a in message_attachments.get((m.get("id") or "").strip()) or []:
+            if used >= total_cap:
+                break
+            text = (a.get("text") or "").strip()
+            if not text:
+                continue
+            name = a.get("filename") or "attachment"
+            mime = a.get("mime_type") or ""
+            size = a.get("size") or 0
+            remaining_total = total_cap - used
+            if len(text) > remaining_total:
+                text = text[:remaining_total]
+            if not text:
+                break
+            body_lines.append(f"### Attachment: {name} ({mime}, {size} bytes)")
+            body_lines.append(text)
+            used += len(text)
+            indexable = True
+            attachment_meta.append(
+                {"filename": name, "mime_type": mime, "size": size, "chars": len(text)}
+            )
+
+    if not indexable and not snippet:
+        return None
+
+    content = "\n".join(header_lines + body_lines)
+    filename = f"gmail_thread_{_safe_filename_part(thread_id)}.md"
+
+    return {
+        "filename": filename,
+        "content": content,
+        "stable_key": stable_key,
+        # Latest message id (for permalink/debug); the doc is keyed by
+        # thread, not message.
+        "message_id": latest_message_id,
+        "thread_id": thread_id,
+        "message_count": len(msgs),
+        "document_type": "email",
+        "snippet": _truncate(snippet, 280),
+        "permalink": permalink,
+        # Recency anchor = latest message time (unix seconds).
+        "timestamp": _gmail_internal_date_seconds(latest),
+        "attachments": attachment_meta,
+        # Default memory owner = the latest sender.
+        "from_name": sender or None,
+    }
+
+
+def _delete_gmail_thread(
+    *,
+    hydra: Any,
+    workspace_id: str,
+    connection_id: Optional[str],
+    thread_id: str,
+    summary: Dict[str, Any],
+) -> None:
+    """
+    Remove a consolidated thread document + its derived memories when the
+    whole thread is gone. Best-effort; never raises.
+    """
+    key = stable_key_for_gmail_thread(thread_id)
+    try:
+        hydra.delete_knowledge([key])
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "gmail_thread_delete_failed",
+            extra={"workspace_id": workspace_id, "connection_id": connection_id, "thread_id": thread_id, "error": type(e).__name__},
+        )
+    try:
+        from memory_store import delete_memories_by_source  # noqa: PLC0415
+
+        delete_memories_by_source(workspace_id=workspace_id, source_stable_key=key)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "gmail_thread_memory_delete_failed",
+            extra={"workspace_id": workspace_id, "connection_id": connection_id, "thread_id": thread_id, "error": type(e).__name__},
+        )
+    summary["threads_deleted"] += 1
+    logger.info(
+        "gmail_thread_deleted",
+        extra={"workspace_id": workspace_id, "connection_id": connection_id, "thread_id": thread_id},
+    )
+
+
+def _materialize_gmail_thread(
+    connection: Dict[str, Any],
+    thread_id: str,
+    *,
+    hydra: Any,
+    workspace_id: str,
+    connection_id: Optional[str],
+    connection_email: str,
+    summary: Dict[str, Any],
+) -> None:
+    """
+    (Re)build the consolidated document for ONE Gmail thread and reconcile
+    HydraDB + memories. This single operation is the unit of work for adds,
+    replies, re-syncs, deletions, AND lazy migration off legacy per-message
+    docs:
+
+      - Thread gone (threads.get 404 / no messages) -> delete the
+        consolidated `gmail:thread:` doc + its memories.
+      - Thread present -> rebuild + upload the consolidated doc, extract
+        memory under the thread key, then delete any legacy
+        `gmail:msg:<id>` docs (+ memories) for the thread's messages so a
+        migrated thread never coexists with its old per-message docs.
+
+    Fully defensive: never raises into the runner; every HydraDB / memory
+    step is best-effort. One threads.get call returns all messages with
+    payloads, so the message body path needs no per-message fetch.
+    """
+    thread_id = (thread_id or "").strip()
+    if not thread_id:
+        return
+
+    try:
+        thread = retry_with_backoff(
+            fetch_thread,
+            connection,
+            thread_id,
+            attempts=2,
+            initial_delay=0.5,
+            max_delay=2.0,
+            retry_on=(GmailApiError,),
+            op_name="gmail_fetch_thread",
+        )
+    except GmailApiError:
+        summary["threads_failed"] += 1
+        return
+
+    messages = [m for m in ((thread or {}).get("messages") or []) if isinstance(m, dict)]
+    if not thread or not messages:
+        # Whole thread is gone -> remove the consolidated doc + memories.
+        _delete_gmail_thread(
+            hydra=hydra,
+            workspace_id=workspace_id,
+            connection_id=connection_id,
+            thread_id=thread_id,
+            summary=summary,
+        )
+        return
+
+    summary["messages_fetched"] += len(messages)
+
+    # Gather attachments per message (Phase C), keyed by message id.
+    message_attachments: Dict[str, List[Dict[str, Any]]] = {}
+    for m in messages:
+        mid = (m.get("id") or "").strip()
+        if not mid:
+            continue
+        try:
+            message_attachments[mid] = gather_attachment_sections(connection, m, summary)
+        except Exception as e:  # noqa: BLE001
+            message_attachments[mid] = []
+            logger.warning(
+                "gmail_attachments_gather_failed",
+                extra={"workspace_id": workspace_id, "connection_id": connection_id, "thread_id": thread_id, "error": type(e).__name__},
+            )
+
+    doc = build_email_thread_document(messages, connection_email, message_attachments=message_attachments)
+    if doc is None:
+        summary["threads_skipped"] += 1
+        return
+
+    # Upload the consolidated thread document.
+    from hydradb_client import summarize_upload_response  # noqa: PLC0415
+
+    try:
+        response = hydra.upload_knowledge([doc])
+    except Exception as e:  # noqa: BLE001
+        emit_dead_letter(
+            kind="gmail_ingest_upload",
+            workspace_id=workspace_id,
+            error=e,
+            context={"connection_id": connection_id, "thread_id": thread_id, "file_count": 1},
+        )
+        summary["threads_failed"] += 1
+        summary["messages_failed"] += len(messages)
+        return
+
+    ok, _bad = summarize_upload_response(response if isinstance(response, dict) else {}, batch_size=1)
+    if not ok:
+        summary["threads_failed"] += 1
+        summary["messages_failed"] += len(messages)
+        return
+
+    summary["threads_uploaded"] += 1
+    summary["threads_processed"] += 1
+    summary["messages_uploaded"] += len(messages)
+
+    # Memory extraction under the THREAD key (the whole conversation), so a
+    # question like "what did we decide in the pricing thread?" extracts
+    # from one coherent unit. Defensive: failure never blocks ingest.
+    try:
+        from memory_store import extract_and_persist  # noqa: PLC0415
+
+        extract_and_persist(
+            workspace_id=workspace_id,
+            source_kind="gmail",
+            source_stable_key=doc["stable_key"],
+            source_timestamp=_gmail_ts_to_iso(doc.get("timestamp")),
+            text=doc.get("content") or "",
+            default_owner=(doc.get("from_name") or None),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "gmail_memory_extract_failed",
+            extra={"workspace_id": workspace_id, "connection_id": connection_id, "thread_id": thread_id, "error": type(e).__name__},
+        )
+
+    # Lazy migration / dedup: delete legacy per-message docs (+ memories)
+    # for the messages now consolidated here, so a touched thread never
+    # duplicates content with its pre-Phase-D per-message documents.
+    legacy_keys = [
+        stable_key_for_gmail_message((m.get("id") or "").strip())
+        for m in messages
+        if (m.get("id") or "").strip()
+    ]
+    if legacy_keys:
+        try:
+            hydra.delete_knowledge(legacy_keys)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "gmail_legacy_msg_delete_failed",
+                extra={"workspace_id": workspace_id, "connection_id": connection_id, "thread_id": thread_id, "error": type(e).__name__},
+            )
+        try:
+            from memory_store import delete_memories_by_source  # noqa: PLC0415
+
+            for key in legacy_keys:
+                try:
+                    delete_memories_by_source(workspace_id=workspace_id, source_stable_key=key)
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# ---------------------------------------------------------------------- #
 # Per-workspace ingestion runner
 # ---------------------------------------------------------------------- #
 # Synchronous on purpose: the caller wires this into a FastAPI
@@ -1659,6 +2141,12 @@ def run_workspace_gmail_ingest(
         "messages_failed": 0,
         "messages_skipped": 0,
         "messages_deleted": 0,
+        # Phase D thread-aware counters.
+        "threads_processed": 0,
+        "threads_uploaded": 0,
+        "threads_failed": 0,
+        "threads_skipped": 0,
+        "threads_deleted": 0,
         "attachments_processed": 0,
         "attachments_failed": 0,
         "attachments_skipped": 0,
@@ -1730,10 +2218,10 @@ def run_workspace_gmail_ingest(
         )
         state_map = {}
 
-    # Seen-this-run set used to dedupe message ids if Gmail returns
-    # the same id under two labels in one sweep (rare but possible
-    # for cross-labeled messages).
+    # Seen-this-run sets used to dedupe across labels in one sweep (a
+    # message/thread can carry two labels). Phase D operates per THREAD.
     seen_message_ids_this_run: set = set()
+    seen_thread_ids_this_run: set = set()
 
     logger.info(
         "gmail_ingest_start",
@@ -1778,7 +2266,7 @@ def run_workspace_gmail_ingest(
             use_incremental = bool(last_history_id)
         # sync_mode == "full" -> never use incremental.
 
-        message_ids: List[str] = []
+        affected_thread_ids: List[str] = []
         new_history_id: Optional[str] = None
         invalidated_this_label = False
         effective_label_mode = "full"
@@ -1829,15 +2317,14 @@ def run_workspace_gmail_ingest(
                 # Fall through to the full-listing path below.
                 use_incremental = False
             else:
-                message_ids = hist_result.get("message_ids") or []
                 new_history_id = hist_result.get("next_history_id")
                 effective_label_mode = "incremental"
 
-                # Deleted-email sync: remove permanently-deleted messages
-                # from HydraDB and clear their derived memories. Runs only
-                # on the incremental path (full listing carries no
-                # deletion signal) and never blocks the added-message
-                # ingestion below.
+                # Legacy deletion cleanup (Phase A): remove any pre-Phase-D
+                # per-message `gmail:msg:` docs + their memories for
+                # permanently-deleted messages. Safe no-op once a thread
+                # has been migrated to a consolidated thread doc. Never
+                # blocks the thread (re)materialization below.
                 deleted_ids = hist_result.get("deleted_message_ids") or []
                 if deleted_ids:
                     _process_gmail_deletions(
@@ -1849,11 +2336,22 @@ def run_workspace_gmail_ingest(
                         summary=summary,
                     )
 
+                # Thread-aware sync: ANY added OR deleted message marks its
+                # thread for (re)materialization. Gmail history carries
+                # threadId on both, so a deleted message's thread resolves
+                # without re-fetching the gone message. The materializer
+                # re-fetches each thread and either rebuilds it (still has
+                # messages) or deletes the consolidated doc (fully gone).
+                for tid in (hist_result.get("added_thread_ids") or []) + (hist_result.get("deleted_thread_ids") or []):
+                    tid = (tid or "").strip()
+                    if tid and tid not in affected_thread_ids:
+                        affected_thread_ids.append(tid)
+
         if not use_incremental:
-            # Full listing path. Same as Phase 8 behavior.
+            # Full listing path -> the set of recent THREADS for the label.
             try:
-                message_ids = retry_with_backoff(
-                    list_message_ids_for_label,
+                affected_thread_ids = retry_with_backoff(
+                    list_thread_ids_for_label,
                     connection,
                     label_id,
                     max_results=min(remaining, 100),
@@ -1861,7 +2359,7 @@ def run_workspace_gmail_ingest(
                     initial_delay=0.5,
                     max_delay=4.0,
                     retry_on=(GmailApiError,),
-                    op_name="gmail_list_messages",
+                    op_name="gmail_list_threads",
                 )
             except GmailApiError as e:
                 summary["labels_failed"] += 1
@@ -1872,7 +2370,7 @@ def run_workspace_gmail_ingest(
                     context={
                         "connection_id": connection_id,
                         "label_id": label_id,
-                        "stage": "list_messages",
+                        "stage": "list_threads",
                     },
                 )
                 continue
@@ -1896,115 +2394,30 @@ def run_workspace_gmail_ingest(
                 except GmailApiError:
                     new_history_id = None
 
-        # Dedupe across labels in this same run.
-        message_ids = [mid for mid in message_ids if mid and mid not in seen_message_ids_this_run]
+        # Dedupe threads across labels in this same run (a thread can be
+        # reachable under more than one label).
+        affected_thread_ids = [
+            t for t in affected_thread_ids if t and t not in seen_thread_ids_this_run
+        ]
 
-        prepared: List[Dict[str, Any]] = []
-        for mid in message_ids:
+        # Materialize each affected thread. The per-run budget (`remaining`)
+        # is now a THREAD budget: one consolidated document per thread.
+        materialized_this_label = 0
+        for tid in affected_thread_ids:
             if remaining <= 0:
                 break
-            seen_message_ids_this_run.add(mid)
-            try:
-                msg = retry_with_backoff(
-                    fetch_message,
-                    connection,
-                    mid,
-                    attempts=2,
-                    initial_delay=0.5,
-                    max_delay=2.0,
-                    retry_on=(GmailApiError,),
-                    op_name="gmail_fetch_message",
-                )
-            except GmailApiError:
-                summary["messages_failed"] += 1
-                continue
-            if not msg:
-                summary["messages_failed"] += 1
-                continue
-            # Phase C: extract supported attachments for this message.
-            # Best-effort and fully bounded; a gather failure degrades to
-            # "no attachments" and never aborts the message.
-            try:
-                attachment_sections = gather_attachment_sections(connection, msg, summary)
-            except Exception as e:  # noqa: BLE001
-                attachment_sections = []
-                logger.warning(
-                    "gmail_attachments_gather_failed",
-                    extra={
-                        "workspace_id": workspace_id,
-                        "connection_id": connection_id,
-                        "label_id": label_id,
-                        "error": type(e).__name__,
-                    },
-                )
-            doc = build_email_document(msg, connection_email, attachments=attachment_sections)
-            if doc is None:
-                summary["messages_skipped"] += 1
-                continue
-            prepared.append(doc)
-            summary["messages_fetched"] += 1
-            remaining -= 1
-
-        if prepared:
-            try:
-                response = hydra.upload_knowledge(prepared)
-            except Exception as e:  # noqa: BLE001
-                emit_dead_letter(
-                    kind="gmail_ingest_upload",
-                    workspace_id=workspace_id,
-                    error=e,
-                    context={
-                        "connection_id": connection_id,
-                        "label_id": label_id,
-                        "file_count": len(prepared),
-                    },
-                )
-                summary["messages_failed"] += len(prepared)
-                summary["labels_failed"] += 1
-                continue
-            ok, _bad = summarize_upload_response(
-                response if isinstance(response, dict) else {},
-                batch_size=len(prepared),
+            seen_thread_ids_this_run.add(tid)
+            _materialize_gmail_thread(
+                connection,
+                tid,
+                hydra=hydra,
+                workspace_id=workspace_id,
+                connection_id=connection_id,
+                connection_email=connection_email,
+                summary=summary,
             )
-            summary["messages_uploaded"] += ok
-            summary["messages_failed"] += max(0, len(prepared) - ok)
-
-            # Phase 12: extract structured memory from each ingested
-            # email. Defensive: any failure here MUST NOT block the
-            # ingest pass. The subject is included in the body (the
-            # email builder always writes it as a header line) so the
-            # extractor sees it.
-            try:
-                from memory_store import extract_and_persist  # noqa: PLC0415
-
-                for f in prepared:
-                    stable_key = f.get("stable_key") or ""
-                    if not stable_key:
-                        continue
-                    extract_and_persist(
-                        workspace_id=workspace_id,
-                        source_kind="gmail",
-                        source_stable_key=stable_key,
-                        # Gmail's source_timestamp is the email's Date
-                        # header (the builder stamps it under
-                        # `timestamp` as a unix-seconds float). Convert
-                        # to ISO for the timestamptz column.
-                        source_timestamp=_gmail_ts_to_iso(f.get("timestamp")),
-                        text=f.get("content") or "",
-                        # Sender owns any "I will..." action item in
-                        # their email by default.
-                        default_owner=(f.get("from_name") or f.get("from_email") or None),
-                    )
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    "gmail_memory_extract_failed",
-                    extra={
-                        "workspace_id": workspace_id,
-                        "connection_id": connection_id,
-                        "label_id": label_id,
-                        "error": type(e).__name__,
-                    },
-                )
+            materialized_this_label += 1
+            remaining -= 1
 
         # Persist the ingestion-state row. Always stamp last_synced_at;
         # advance last_history_id only when we have a fresh one.
@@ -2036,7 +2449,7 @@ def run_workspace_gmail_ingest(
                 "label_id": label_id,
                 "mode": effective_label_mode,
                 "invalidated": invalidated_this_label,
-                "messages": len(message_ids),
+                "threads": materialized_this_label,
                 "new_history_id": new_history_id,
             }
         )
@@ -2087,6 +2500,8 @@ def run_workspace_gmail_ingest(
             "messages_uploaded": summary["messages_uploaded"],
             "messages_failed": summary["messages_failed"],
             "messages_deleted": summary["messages_deleted"],
+            "threads_processed": summary["threads_processed"],
+            "threads_deleted": summary["threads_deleted"],
             "attachments_processed": summary["attachments_processed"],
             "incremental_label_count": summary["incremental_label_count"],
             "full_label_count": summary["full_label_count"],
@@ -2113,6 +2528,8 @@ def run_workspace_gmail_ingest(
                 "messages_uploaded": summary["messages_uploaded"],
                 "messages_failed": summary["messages_failed"],
                 "messages_deleted": summary["messages_deleted"],
+                "threads_processed": summary["threads_processed"],
+                "threads_deleted": summary["threads_deleted"],
                 "attachments_processed": summary["attachments_processed"],
                 "attachments_failed": summary["attachments_failed"],
                 "incremental_label_count": summary["incremental_label_count"],

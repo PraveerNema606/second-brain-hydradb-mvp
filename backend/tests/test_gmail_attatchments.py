@@ -241,11 +241,13 @@ class TestRunnerAttachmentIngest:
             "status": "active",
         }
 
-    def _msg_with_attachment(self, mid="m1"):
+    def _msg_with_attachment(self, mid="m1", thread_id="t1"):
         # text/plain body + a PDF attachment delivered by attachmentId.
         body = base64.urlsafe_b64encode(b"Email body").rstrip(b"=").decode("ascii")
         return {
             "id": mid,
+            "threadId": thread_id,
+            "internalDate": "1700000000000",
             "snippet": "hi",
             "labelIds": ["INBOX"],
             "payload": {
@@ -263,6 +265,9 @@ class TestRunnerAttachmentIngest:
             },
         }
 
+    def _thread_of(self, *messages):
+        return {"messages": list(messages)}
+
     def test_runner_ingests_attachment_text(self):
         from gmail_oauth import run_workspace_gmail_ingest
 
@@ -276,11 +281,11 @@ class TestRunnerAttachmentIngest:
         mock_hydra.upload_knowledge.side_effect = _capture_upload
 
         with patch(
-            "gmail_oauth.list_message_ids_for_label",
-            return_value=["m1"],
+            "gmail_oauth.list_thread_ids_for_label",
+            return_value=["t1"],
         ), patch(
-            "gmail_oauth.fetch_message",
-            return_value=self._msg_with_attachment("m1"),
+            "gmail_oauth.fetch_thread",
+            return_value=self._thread_of(self._msg_with_attachment("m1", "t1")),
         ), patch(
             "gmail_oauth.fetch_attachment_data",
             return_value=base64.urlsafe_b64encode(b"%PDF").rstrip(b"=").decode("ascii"),
@@ -303,9 +308,12 @@ class TestRunnerAttachmentIngest:
             )
 
         assert stats["attachments_processed"] == 1
+        assert stats["threads_uploaded"] == 1
         assert captured["docs"], "a document should have been uploaded"
+        # Thread doc embeds attachments per message as "### Attachment:".
         assert "EXTRACTED PDF CONTENT" in captured["docs"][0]["content"]
-        assert "## Attachments" in captured["docs"][0]["content"]
+        assert "### Attachment: report.pdf" in captured["docs"][0]["content"]
+        assert captured["docs"][0]["stable_key"] == "gmail:thread:t1"
 
     def test_runner_survives_attachment_extraction_failure(self):
         from gmail_oauth import run_workspace_gmail_ingest
@@ -314,11 +322,11 @@ class TestRunnerAttachmentIngest:
         mock_hydra.upload_knowledge.return_value = {"success": True, "success_count": 1, "failed_count": 0}
 
         with patch(
-            "gmail_oauth.list_message_ids_for_label",
-            return_value=["m1"],
+            "gmail_oauth.list_thread_ids_for_label",
+            return_value=["t1"],
         ), patch(
-            "gmail_oauth.fetch_message",
-            return_value=self._msg_with_attachment("m1"),
+            "gmail_oauth.fetch_thread",
+            return_value=self._thread_of(self._msg_with_attachment("m1", "t1")),
         ), patch(
             "gmail_oauth.fetch_attachment_data",
             return_value=base64.urlsafe_b64encode(b"garbage").rstrip(b"=").decode("ascii"),
@@ -340,10 +348,11 @@ class TestRunnerAttachmentIngest:
                 sync_mode="full",
             )
 
-        # Extraction failed but the email itself is still ingested.
+        # Extraction failed but the thread itself is still ingested.
         assert stats["attachments_failed"] == 1
         assert stats["attachments_processed"] == 0
         assert stats["messages_uploaded"] == 1
+        assert stats["threads_uploaded"] == 1
 
     def test_runner_respects_per_email_cap(self, monkeypatch):
         from gmail_oauth import run_workspace_gmail_ingest
@@ -356,6 +365,8 @@ class TestRunnerAttachmentIngest:
 
         msg = {
             "id": "m1",
+            "threadId": "t1",
+            "internalDate": "1700000000000",
             "snippet": "hi",
             "labelIds": ["INBOX"],
             "payload": {
@@ -372,11 +383,11 @@ class TestRunnerAttachmentIngest:
         mock_hydra.upload_knowledge.return_value = {"success": True, "success_count": 1, "failed_count": 0}
 
         with patch(
-            "gmail_oauth.list_message_ids_for_label",
-            return_value=["m1"],
+            "gmail_oauth.list_thread_ids_for_label",
+            return_value=["t1"],
         ), patch(
-            "gmail_oauth.fetch_message",
-            return_value=msg,
+            "gmail_oauth.fetch_thread",
+            return_value=self._thread_of(msg),
         ), patch(
             "hydradb_client.HydraDBClient",
             return_value=mock_hydra,
@@ -399,7 +410,7 @@ class TestRunnerAttachmentIngest:
         from gmail_oauth import run_workspace_gmail_ingest
 
         with patch(
-            "gmail_oauth.list_message_ids_for_label",
+            "gmail_oauth.list_thread_ids_for_label",
             return_value=[],
         ), patch(
             "hydradb_client.HydraDBClient",
