@@ -96,7 +96,11 @@ class TestBuildThreadDocument:
 
     def test_attachment_embedding(self):
         m1 = _msg("m1", "t1", body="see attached")
-        atts = {"m1": [{"filename": "deck.pdf", "mime_type": "application/pdf", "size": 10, "chars": 9, "text": "SLIDE TEXT"}]}
+        atts = {
+            "m1": [
+                {"filename": "deck.pdf", "mime_type": "application/pdf", "size": 10, "chars": 9, "text": "SLIDE TEXT"}
+            ]
+        }
         doc = go.build_email_thread_document([m1], "owner@x.com", message_attachments=atts)
         assert "### Attachment: deck.pdf" in doc["content"]
         assert "SLIDE TEXT" in doc["content"]
@@ -213,7 +217,11 @@ class TestRunnerThreads:
             "gmail_oauth.fetch_thread", side_effect=lambda conn, tid: threads[tid]
         ), patch("hydradb_client.HydraDBClient", return_value=hydra), patch(
             "supabase_client.upsert_gmail_ingestion_state", return_value=True
-        ), patch("memory_store.extract_and_persist"), patch("memory_store.delete_memories_by_source"):
+        ), patch(
+            "memory_store.extract_and_persist"
+        ), patch(
+            "memory_store.delete_memories_by_source"
+        ):
             stats = go.run_workspace_gmail_ingest(
                 workspace_id="ws-1",
                 connection=self._conn(),
@@ -248,9 +256,13 @@ class TestRunnerThreads:
         ), patch("hydradb_client.HydraDBClient", return_value=hydra), patch(
             "supabase_client.get_gmail_ingestion_state_map",
             return_value={"INBOX": {"last_history_id": "999"}},
-        ), patch("supabase_client.upsert_gmail_ingestion_state", return_value=True), patch(
+        ), patch(
+            "supabase_client.upsert_gmail_ingestion_state", return_value=True
+        ), patch(
             "memory_store.extract_and_persist"
-        ), patch("memory_store.delete_memories_by_source"):
+        ), patch(
+            "memory_store.delete_memories_by_source"
+        ):
             stats = go.run_workspace_gmail_ingest(
                 workspace_id="ws-1",
                 connection=self._conn(),
@@ -277,15 +289,21 @@ class TestRunnerThreads:
             "next_history_id": "1000",
             "invalidated": False,
         }
-        full_thread = {"messages": [_msg("m1", "t1", body="original"), _msg("m2", "t1", body="the reply", ts="1700000900000")]}
+        full_thread = {
+            "messages": [_msg("m1", "t1", body="original"), _msg("m2", "t1", body="the reply", ts="1700000900000")]
+        }
         with patch("gmail_oauth.list_history_message_ids", return_value=hist), patch(
             "gmail_oauth.fetch_thread", return_value=full_thread
         ), patch("hydradb_client.HydraDBClient", return_value=hydra), patch(
             "supabase_client.get_gmail_ingestion_state_map",
             return_value={"INBOX": {"last_history_id": "999"}},
-        ), patch("supabase_client.upsert_gmail_ingestion_state", return_value=True), patch(
+        ), patch(
+            "supabase_client.upsert_gmail_ingestion_state", return_value=True
+        ), patch(
             "memory_store.extract_and_persist"
-        ), patch("memory_store.delete_memories_by_source"):
+        ), patch(
+            "memory_store.delete_memories_by_source"
+        ):
             go.run_workspace_gmail_ingest(
                 workspace_id="ws-1",
                 connection=self._conn(),
@@ -307,7 +325,11 @@ class TestRunnerThreads:
             "gmail_oauth.fetch_thread", return_value={"messages": [_msg("m1", "t1")]}
         ), patch("hydradb_client.HydraDBClient", return_value=hydra), patch(
             "supabase_client.upsert_gmail_ingestion_state", return_value=True
-        ), patch("memory_store.extract_and_persist"), patch("memory_store.delete_memories_by_source"):
+        ), patch(
+            "memory_store.extract_and_persist"
+        ), patch(
+            "memory_store.delete_memories_by_source"
+        ):
             stats = go.run_workspace_gmail_ingest(
                 workspace_id="ws-1",
                 connection=self._conn(),

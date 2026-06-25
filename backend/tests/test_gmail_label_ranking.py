@@ -156,9 +156,7 @@ class TestRerankLabelWiring:
             _chunk(2, "beta", labels=["STARRED"]),
             _chunk(3, "gamma", labels=["IMPORTANT"]),
         ]
-        ranked, _ = rerank_chunks(
-            chunks, terms=[], mode="default", top_k=5, metadata_bias=None
-        )
+        ranked, _ = rerank_chunks(chunks, terms=[], mode="default", top_k=5, metadata_bias=None)
         assert [c["original_index"] for c in ranked] == [1, 2, 3]
 
     def test_exact_mode_label_is_secondary_to_hits(self):

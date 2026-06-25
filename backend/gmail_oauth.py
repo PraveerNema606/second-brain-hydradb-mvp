@@ -1766,9 +1766,7 @@ def build_email_thread_document(
             body_lines.append(text)
             used += len(text)
             indexable = True
-            attachment_meta.append(
-                {"filename": name, "mime_type": mime, "size": size, "chars": len(text)}
-            )
+            attachment_meta.append({"filename": name, "mime_type": mime, "size": size, "chars": len(text)})
 
     if not indexable and not snippet:
         return None
@@ -1814,7 +1812,12 @@ def _delete_gmail_thread(
     except Exception as e:  # noqa: BLE001
         logger.warning(
             "gmail_thread_delete_failed",
-            extra={"workspace_id": workspace_id, "connection_id": connection_id, "thread_id": thread_id, "error": type(e).__name__},
+            extra={
+                "workspace_id": workspace_id,
+                "connection_id": connection_id,
+                "thread_id": thread_id,
+                "error": type(e).__name__,
+            },
         )
     try:
         from memory_store import delete_memories_by_source  # noqa: PLC0415
@@ -1823,7 +1826,12 @@ def _delete_gmail_thread(
     except Exception as e:  # noqa: BLE001
         logger.warning(
             "gmail_thread_memory_delete_failed",
-            extra={"workspace_id": workspace_id, "connection_id": connection_id, "thread_id": thread_id, "error": type(e).__name__},
+            extra={
+                "workspace_id": workspace_id,
+                "connection_id": connection_id,
+                "thread_id": thread_id,
+                "error": type(e).__name__,
+            },
         )
     summary["threads_deleted"] += 1
     logger.info(
@@ -1904,7 +1912,12 @@ def _materialize_gmail_thread(
             message_attachments[mid] = []
             logger.warning(
                 "gmail_attachments_gather_failed",
-                extra={"workspace_id": workspace_id, "connection_id": connection_id, "thread_id": thread_id, "error": type(e).__name__},
+                extra={
+                    "workspace_id": workspace_id,
+                    "connection_id": connection_id,
+                    "thread_id": thread_id,
+                    "error": type(e).__name__,
+                },
             )
 
     doc = build_email_thread_document(messages, connection_email, message_attachments=message_attachments)
@@ -1968,16 +1981,19 @@ def _materialize_gmail_thread(
     except Exception as e:  # noqa: BLE001
         logger.warning(
             "gmail_memory_extract_failed",
-            extra={"workspace_id": workspace_id, "connection_id": connection_id, "thread_id": thread_id, "error": type(e).__name__},
+            extra={
+                "workspace_id": workspace_id,
+                "connection_id": connection_id,
+                "thread_id": thread_id,
+                "error": type(e).__name__,
+            },
         )
 
     # Lazy migration / dedup: delete legacy per-message docs (+ memories)
     # for the messages now consolidated here, so a touched thread never
     # duplicates content with its pre-Phase-D per-message documents.
     legacy_keys = [
-        stable_key_for_gmail_message((m.get("id") or "").strip())
-        for m in messages
-        if (m.get("id") or "").strip()
+        stable_key_for_gmail_message((m.get("id") or "").strip()) for m in messages if (m.get("id") or "").strip()
     ]
     if legacy_keys:
         try:
@@ -1985,7 +2001,12 @@ def _materialize_gmail_thread(
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 "gmail_legacy_msg_delete_failed",
-                extra={"workspace_id": workspace_id, "connection_id": connection_id, "thread_id": thread_id, "error": type(e).__name__},
+                extra={
+                    "workspace_id": workspace_id,
+                    "connection_id": connection_id,
+                    "thread_id": thread_id,
+                    "error": type(e).__name__,
+                },
             )
         try:
             from memory_store import delete_memories_by_source  # noqa: PLC0415
@@ -2409,9 +2430,7 @@ def run_workspace_gmail_ingest(
 
         # Dedupe threads across labels in this same run (a thread can be
         # reachable under more than one label).
-        affected_thread_ids = [
-            t for t in affected_thread_ids if t and t not in seen_thread_ids_this_run
-        ]
+        affected_thread_ids = [t for t in affected_thread_ids if t and t not in seen_thread_ids_this_run]
 
         # DIAGNOSTIC (instrumentation only): how many threads this label
         # resolved to, and the sub-tenant we will write them into. Lets us

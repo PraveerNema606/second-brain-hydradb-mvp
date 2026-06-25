@@ -180,7 +180,13 @@ class TestBuildEmailDocumentAttachments:
         from gmail_oauth import build_email_document
 
         sections = [
-            {"filename": "proposal.pdf", "mime_type": "application/pdf", "size": 1200, "chars": 20, "text": "PDF PROPOSAL TEXT"},
+            {
+                "filename": "proposal.pdf",
+                "mime_type": "application/pdf",
+                "size": 1200,
+                "chars": 20,
+                "text": "PDF PROPOSAL TEXT",
+            },
             {"filename": "data.csv", "mime_type": "text/csv", "size": 50, "chars": 10, "text": "a,b\n1,2"},
         ]
         doc = build_email_document(self._msg(), "owner@example.com", attachments=sections)

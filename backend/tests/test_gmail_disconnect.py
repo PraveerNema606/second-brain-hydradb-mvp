@@ -20,9 +20,7 @@ def _client_with(select_data, delete_data):
     client = MagicMock()
     table = client.table.return_value
 
-    select_exec = (
-        table.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute
-    )
+    select_exec = table.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute
     select_exec.return_value = MagicMock(data=select_data)
 
     delete_exec = table.delete.return_value.eq.return_value.eq.return_value.execute
@@ -130,17 +128,15 @@ class TestSetGmailConnectionStatus:
         from supabase_client import set_gmail_connection_status
 
         with patch("supabase_client.get_supabase") as mock_get:
-            assert set_gmail_connection_status(
-                connection_id="", workspace_id="ws-1", status="revoked"
-            ) is False
+            assert set_gmail_connection_status(connection_id="", workspace_id="ws-1", status="revoked") is False
         mock_get.assert_not_called()
 
     def test_db_error_returns_false(self):
         from supabase_client import set_gmail_connection_status
 
         client = MagicMock()
-        client.table.return_value.update.return_value.eq.return_value.eq.return_value.execute.side_effect = RuntimeError(
-            "boom"
+        client.table.return_value.update.return_value.eq.return_value.eq.return_value.execute.side_effect = (
+            RuntimeError("boom")
         )
         with patch("supabase_client.get_supabase", return_value=client):
             ok = set_gmail_connection_status(

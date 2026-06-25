@@ -145,17 +145,11 @@ class TestRunnerDeletionProcessing:
             )
 
         # HydraDB deletion: one batched call with both stable keys.
-        mock_hydra_instance.delete_knowledge.assert_called_once_with(
-            ["gmail:msg:d1", "gmail:msg:d2"]
-        )
+        mock_hydra_instance.delete_knowledge.assert_called_once_with(["gmail:msg:d1", "gmail:msg:d2"])
         # Memory cleanup: one call per deleted source key.
         assert mock_mem_del.call_count == 2
-        mock_mem_del.assert_any_call(
-            workspace_id="ws-1", source_stable_key="gmail:msg:d1"
-        )
-        mock_mem_del.assert_any_call(
-            workspace_id="ws-1", source_stable_key="gmail:msg:d2"
-        )
+        mock_mem_del.assert_any_call(workspace_id="ws-1", source_stable_key="gmail:msg:d1")
+        mock_mem_del.assert_any_call(workspace_id="ws-1", source_stable_key="gmail:msg:d2")
         assert stats["messages_deleted"] == 2
 
     def test_hydra_delete_failure_does_not_break_run(self):

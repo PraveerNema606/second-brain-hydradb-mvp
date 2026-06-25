@@ -1974,7 +1974,9 @@ def set_gmail_connection_status(
         client = get_supabase()
         client.table("gmail_connections").update(
             {"status": status},
-        ).eq("id", connection_id).eq("workspace_id", workspace_id).execute()
+        ).eq(
+            "id", connection_id
+        ).eq("workspace_id", workspace_id).execute()
     except Exception as e:  # noqa: BLE001
         logger.warning(
             'supabase_set_gmail_connection_status_failed',
