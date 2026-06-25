@@ -3,6 +3,7 @@ Minimal HydraDB client for the Second Brain MVP.
 
 Endpoints used:
     POST {base_url}/ingestion/upload_knowledge   (ingestion — multipart)
+    POST {base_url}/ingestion/delete_knowledge   (deletion — JSON)
     POST {base_url}/recall/full_recall           (retrieval — JSON)
 
 Verified ingestion contract:
@@ -61,6 +62,18 @@ def _post_upload(url: str, headers: dict, data: dict, files: list) -> requests.R
     retryable_exceptions=(requests.Timeout, requests.ConnectionError, OSError),
 )
 def _post_recall(url: str, headers: dict, payload: dict) -> requests.Response:
+    return requests.post(url, headers=headers, json=payload, timeout=60)
+
+
+# Retry-wrapped POST used by HydraDBClient.delete_knowledge.  Same retry
+# policy as recall/upload: network transients retry, auth / 4xx do not.
+@retry(
+    service="hydradb",
+    max_attempts=3,
+    initial_delay=1.0,
+    retryable_exceptions=(requests.Timeout, requests.ConnectionError, OSError),
+)
+def _post_delete(url: str, headers: dict, payload: dict) -> requests.Response:
     return requests.post(url, headers=headers, json=payload, timeout=60)
 
 
@@ -211,12 +224,23 @@ class HydraDBClient:
             return {}
 
         level = logging.DEBUG if response.status_code < 400 else logging.WARNING
+        # DIAGNOSTIC (instrumentation only): surface the write sub-tenant and
+        # a short response-body preview so a silent upload rejection (4xx/5xx
+        # body) is visible and attributable to the correct sub-tenant. No
+        # behavior change -- still returns {} on >=400 below.
+        try:
+            _resp_preview = (response.text or "")[:300]
+        except Exception:  # noqa: BLE001
+            _resp_preview = "<unavailable>"
         logger.log(
             level,
             'hydradb_upload_response',
             extra={
                 'http_status': response.status_code,
+                'status_code': response.status_code,
+                'sub_tenant': self.sub_tenant_id,
                 'file_count': len(files),
+                'response_preview': _resp_preview,
             },
         )
 
@@ -254,6 +278,81 @@ class HydraDBClient:
         )
 
         return payload
+
+    # ------------------------------------------------------------------ #
+    # Deletion
+    # ------------------------------------------------------------------ #
+    def delete_knowledge(self, source_keys: List[str]) -> Dict[str, Any]:
+        """
+        Delete previously-ingested documents from HydraDB by their stable
+        source key(s).
+
+        Used when an upstream source is removed (e.g. a Gmail message is
+        permanently deleted) so recall stops returning stale content.
+
+        `source_keys` are the stable keys we stamp into each document's
+        markdown header as `Source Key:` (e.g. "gmail:msg:1899abcd").
+
+        Wire contract (POST /ingestion/delete_knowledge, JSON):
+            {
+              "tenant_id":     <HYDRADB_TENANT_ID>,
+              "sub_tenant_id": <this client's sub-tenant>,
+              "source_keys":   ["gmail:msg:...", ...]
+            }
+
+        Returns the parsed response dict on success, or {} on any
+        failure. Best-effort and non-raising by design (mirrors
+        upload_knowledge, not full_recall): a cleanup pass must never
+        crash the surrounding ingest run. Network transients are retried
+        by _post_delete; auth / 4xx are not.
+
+        NOTE: the exact `SourceDeleteRequest` field name/identity is the
+        one part of this contract not verifiable from the consumer repo
+        (HydraDB never receives the stable_key on upload -- only the
+        filename + content). We key on the stable source key here; if a
+        deployment keys deletion on a different field, this is the single
+        place to adjust.
+        """
+        keys = [k.strip() for k in (source_keys or []) if k and str(k).strip()]
+        if not keys:
+            logger.debug('hydradb_delete_skipped', extra={'reason': 'no_keys'})
+            return {}
+
+        url = f"{self.base_url}/ingestion/delete_knowledge"
+        payload = {
+            "tenant_id": self.tenant_id,
+            "sub_tenant_id": self.sub_tenant_id,
+            "source_keys": keys,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            response = _post_delete(url, headers, payload)
+        except (requests.RequestException, RetryExhausted) as e:
+            logger.warning(
+                'hydradb_delete_network_error',
+                extra={'error': type(e).__name__, 'key_count': len(keys)},
+            )
+            return {}
+
+        level = logging.DEBUG if response.status_code < 400 else logging.WARNING
+        logger.log(
+            level,
+            'hydradb_delete_response',
+            extra={'http_status': response.status_code, 'key_count': len(keys)},
+        )
+
+        if response.status_code >= 400:
+            return {}
+
+        try:
+            return response.json()
+        except ValueError:
+            logger.warning('hydradb_delete_non_json', extra={'http_status': response.status_code})
+            return {}
 
     # ------------------------------------------------------------------ #
     # Retrieval

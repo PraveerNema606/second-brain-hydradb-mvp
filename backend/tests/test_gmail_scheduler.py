@@ -274,7 +274,7 @@ class TestIncrementalSyncMode:
         if listing_ids is not None:
             ctx.append(
                 patch(
-                    "gmail_oauth.list_message_ids_for_label",
+                    "gmail_oauth.list_thread_ids_for_label",
                     return_value=listing_ids,
                 )
             )
@@ -285,10 +285,11 @@ class TestIncrementalSyncMode:
                     return_value=profile,
                 )
             )
-        # No-op fetch (we don't care about message body in these tests).
+        # No-op thread fetch (we don't care about message bodies in these
+        # tests; the listings above return no threads).
         ctx.append(
             patch(
-                "gmail_oauth.fetch_message",
+                "gmail_oauth.fetch_thread",
                 return_value=None,
             )
         )
@@ -427,7 +428,7 @@ class TestTokenRefreshPersistence:
             return []
 
         with patch(
-            "gmail_oauth.list_message_ids_for_label",
+            "gmail_oauth.list_thread_ids_for_label",
             side_effect=list_with_refresh,
         ), patch(
             "supabase_client.get_gmail_ingestion_state_map",
@@ -469,7 +470,7 @@ class TestTokenRefreshPersistence:
         from gmail_oauth import run_workspace_gmail_ingest
 
         with patch(
-            "gmail_oauth.list_message_ids_for_label",
+            "gmail_oauth.list_thread_ids_for_label",
             return_value=[],
         ), patch(
             "supabase_client.get_gmail_ingestion_state_map",
@@ -510,7 +511,7 @@ class TestSyncStatusMetadata:
             "supabase_client.get_gmail_ingestion_state_map",
             return_value={},
         ), patch(
-            "gmail_oauth.list_message_ids_for_label",
+            "gmail_oauth.list_thread_ids_for_label",
             return_value=[],
         ), patch(
             "supabase_client.upsert_gmail_ingestion_state",

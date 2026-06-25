@@ -1845,9 +1845,39 @@ def delete_gmail_connection(
     """
     Delete a Gmail connection (cascades to labels + ingestion state via
     ON DELETE CASCADE). Returns True if a row was actually deleted.
+
+    Disconnect hygiene: after a successful delete we best-effort revoke
+    the stored Google OAuth grant so the disconnected account's tokens
+    can't be reused. The row removal is what stops all future syncs
+    (the scheduler joins on the connection existing); the Google-side
+    revocation is upstream hygiene layered on top. Revocation failures
+    NEVER change the result -- the delete is authoritative.
     """
     if not connection_id or not workspace_id:
         return False
+
+    # Best-effort, workspace-scoped read of the grant so we can revoke it
+    # at Google after the delete. A read failure just skips revocation.
+    revoke_target = ""
+    try:
+        client = get_supabase()
+        sel = (
+            client.table("gmail_connections")
+            .select("refresh_token, access_token")
+            .eq("id", connection_id)
+            .eq("workspace_id", workspace_id)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(sel, "data", None) or []
+        if rows:
+            revoke_target = (rows[0].get("refresh_token") or rows[0].get("access_token") or "").strip()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            'supabase_delete_gmail_connection_read_failed',
+            extra={'connection_id': connection_id, 'error': type(e).__name__},
+        )
+
     try:
         client = get_supabase()
         resp = (
@@ -1864,7 +1894,23 @@ def delete_gmail_connection(
         )
         return False
     rows = getattr(resp, "data", None) or []
-    return bool(rows)
+    deleted = bool(rows)
+
+    if deleted and revoke_target:
+        # Lazy import avoids a module import cycle (gmail_oauth imports
+        # supabase_client). revoke_token never raises, but we still guard
+        # so a disconnect can't fail on upstream hygiene.
+        try:
+            from gmail_oauth import revoke_token  # noqa: PLC0415
+
+            revoke_token(revoke_target)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                'gmail_disconnect_revoke_failed',
+                extra={'connection_id': connection_id, 'error': type(e).__name__},
+            )
+
+    return deleted
 
 
 def update_gmail_connection_tokens(
@@ -1898,6 +1944,47 @@ def update_gmail_connection_tokens(
         logger.warning(
             'supabase_update_gmail_tokens_failed',
             extra={'connection_id': connection_id, 'error': type(e).__name__},
+        )
+        return False
+    return True
+
+
+def set_gmail_connection_status(
+    *,
+    connection_id: str,
+    workspace_id: str,
+    status: str,
+) -> bool:
+    """
+    Persist the health status of a Gmail connection ('active' |
+    'revoked' | 'error').
+
+    Workspace-scoped for defense in depth, exactly like
+    update_gmail_connection_tokens -- a status flip can never touch
+    another workspace's row.
+
+    Returns True on a successful write, False on any failure (logged).
+    Best-effort: callers (notably gmail_oauth._authed_request via
+    _mark_connection_status) must not let a status-write failure mask the
+    underlying Gmail error.
+    """
+    if not connection_id or not workspace_id or not status:
+        return False
+    try:
+        client = get_supabase()
+        client.table("gmail_connections").update(
+            {"status": status},
+        ).eq(
+            "id", connection_id
+        ).eq("workspace_id", workspace_id).execute()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            'supabase_set_gmail_connection_status_failed',
+            extra={
+                'connection_id': connection_id,
+                'status': status,
+                'error': type(e).__name__,
+            },
         )
         return False
     return True

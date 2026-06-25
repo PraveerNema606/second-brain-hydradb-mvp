@@ -107,7 +107,7 @@ class TestEntityResolution:
         alias_map = build_alias_map(rows)
         people = {k: v for k, v in alias_map["entities"].items() if v["entity_type"] == "person"}
         assert len(people) == 1, f"expected one merged person, got {list(people)}"
-        (canonical_id, person), = people.items()
+        ((canonical_id, person),) = people.items()
         assert person["canonical"] == "Rahul Verma"
         assert "U0123ABCD" in person["aliases"]
         assert "rahul.verma" in person["aliases"]
@@ -129,11 +129,7 @@ class TestEntityResolution:
             _person("Rahul Sharma", "slack:msg:C1:2"),
             _person("Rahul", "slack:msg:C1:3"),
         ]
-        people = {
-            v["canonical"]
-            for v in build_alias_map(rows)["entities"].values()
-            if v["entity_type"] == "person"
-        }
+        people = {v["canonical"] for v in build_alias_map(rows)["entities"].values() if v["entity_type"] == "person"}
         assert people == {"Rahul Verma", "Rahul Sharma", "Rahul"}
 
     def test_unambiguous_first_name_merges(self):
@@ -345,7 +341,9 @@ class TestMemoryImportance:
 
         fresh = _row(kind="action_item", content="task aa", source_stable_key="s:1", days_ago=0, rid="fresh")
         stale = _row(kind="action_item", content="task bb", source_stable_key="s:2", days_ago=120, rid="stale")
-        owned = _row(kind="action_item", content="task cc", owner="Rahul", source_stable_key="s:3", days_ago=0, rid="owned")
+        owned = _row(
+            kind="action_item", content="task cc", owner="Rahul", source_stable_key="s:3", days_ago=0, rid="owned"
+        )
         scores = compute_memory_importance([fresh, stale, owned])
         assert scores["fresh"] > scores["stale"]
         assert scores["owned"] > scores["fresh"]
@@ -538,8 +536,13 @@ class TestConversationReconstruction:
             _row(kind="action_item", content="benchmark Railway and Render", source_stable_key="s:old", days_ago=10),
             # The decision source.
             _project("Apollo", "s:dec", days_ago=2),
-            _row(kind="decision", content="we will use Railway for Apollo", source_stable_key="s:dec", days_ago=2,
-                 rid="dec-1"),
+            _row(
+                kind="decision",
+                content="we will use Railway for Apollo",
+                source_stable_key="s:dec",
+                days_ago=2,
+                rid="dec-1",
+            ),
             # A LATER memory that must be excluded from the backward walk.
             _project("Apollo", "s:new", days_ago=0.5),
             _row(kind="summary", content="Railway rollout going well", source_stable_key="s:new", days_ago=0.5),

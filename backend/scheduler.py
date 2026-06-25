@@ -49,7 +49,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from gmail_oauth import run_workspace_gmail_ingest
 from logging_config import get_logger
-from retry import RetryExhausted, retry
+from retry import RetryExhausted
 from slack_oauth import run_workspace_ingest
 from supabase_client import (
     list_active_workspaces_with_gmail,

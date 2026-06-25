@@ -520,7 +520,7 @@ class TestRunWorkspaceGmailIngest:
         from gmail_oauth import run_workspace_gmail_ingest
 
         with patch(
-            "gmail_oauth.list_message_ids_for_label",
+            "gmail_oauth.list_thread_ids_for_label",
             return_value=[],
         ), patch(
             "hydradb_client.HydraDBClient",
@@ -540,7 +540,7 @@ class TestRunWorkspaceGmailIngest:
         from gmail_oauth import run_workspace_gmail_ingest
 
         with patch(
-            "gmail_oauth.list_message_ids_for_label",
+            "gmail_oauth.list_thread_ids_for_label",
             return_value=[],
         ), patch(
             "hydradb_client.HydraDBClient",
@@ -591,7 +591,7 @@ class TestRunWorkspaceGmailIngest:
         from gmail_oauth import run_workspace_gmail_ingest
 
         with patch(
-            "gmail_oauth.list_message_ids_for_label",
+            "gmail_oauth.list_thread_ids_for_label",
         ) as mock_list, patch(
             "hydradb_client.HydraDBClient",
         ), patch(
@@ -613,7 +613,7 @@ class TestRunWorkspaceGmailIngest:
 
         monkeypatch.setenv("GMAIL_ALLOW_SPAM_TRASH", "true")
         with patch(
-            "gmail_oauth.list_message_ids_for_label",
+            "gmail_oauth.list_thread_ids_for_label",
             return_value=[],
         ) as mock_list, patch(
             "hydradb_client.HydraDBClient",
@@ -632,32 +632,40 @@ class TestRunWorkspaceGmailIngest:
         assert stats["labels_processed"] == 1
 
     def test_max_messages_cap_respected(self):
-        # Cap at 2 even if Gmail returns 5 IDs.
+        # Cap at 2 even if Gmail returns 5 thread IDs. The per-run budget
+        # is now a THREAD budget, so at most 2 threads are fetched.
         from gmail_oauth import run_workspace_gmail_ingest
 
-        msg = {
-            "id": "m1",
-            "snippet": "hi",
-            "labelIds": ["INBOX"],
-            "payload": {
-                "mimeType": "text/plain",
-                "body": {"data": ""},
-                "headers": [{"name": "Subject", "value": "x"}],
-            },
-        }
+        def _thread(tid):
+            return {
+                "messages": [
+                    {
+                        "id": f"{tid}-m1",
+                        "threadId": tid,
+                        "snippet": "hi",
+                        "internalDate": "1700000000000",
+                        "labelIds": ["INBOX"],
+                        "payload": {
+                            "mimeType": "text/plain",
+                            "body": {"data": ""},
+                            "headers": [{"name": "Subject", "value": "x"}],
+                        },
+                    }
+                ]
+            }
 
         mock_hydra_instance = MagicMock()
         mock_hydra_instance.upload_knowledge.return_value = {
             "success": True,
-            "success_count": 2,
+            "success_count": 1,
             "failed_count": 0,
         }
         with patch(
-            "gmail_oauth.list_message_ids_for_label",
-            return_value=["m1", "m2", "m3", "m4", "m5"],
+            "gmail_oauth.list_thread_ids_for_label",
+            return_value=["t1", "t2", "t3", "t4", "t5"],
         ), patch(
-            "gmail_oauth.fetch_message",
-            return_value=msg,
+            "gmail_oauth.fetch_thread",
+            side_effect=lambda conn, tid: _thread(tid),
         ) as mock_fetch, patch(
             "hydradb_client.HydraDBClient",
             return_value=mock_hydra_instance,
@@ -672,15 +680,16 @@ class TestRunWorkspaceGmailIngest:
                 hydradb_sub_tenant_id="ws_x",
                 max_messages=2,
             )
-        # fetch_message gets called at most max_messages times.
+        # fetch_thread is called at most max_messages (= thread budget) times.
         assert mock_fetch.call_count <= 2
-        assert stats["messages_fetched"] <= 2
+        assert stats["threads_processed"] <= 2
+        assert stats["threads_uploaded"] <= 2
 
     def test_returns_stats_shape(self):
         from gmail_oauth import run_workspace_gmail_ingest
 
         with patch(
-            "gmail_oauth.list_message_ids_for_label",
+            "gmail_oauth.list_thread_ids_for_label",
             return_value=[],
         ), patch(
             "hydradb_client.HydraDBClient",
