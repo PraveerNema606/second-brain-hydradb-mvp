@@ -191,12 +191,16 @@ class TestSaveChannels:
 class TestRunIngest:
     def test_kicks_off_background_ingest(self, client, jwt_auth_headers):
         install = {"bot_token": "xoxb-test"}
+        channel_settings = [
+            {"slack_channel_id": "C1", "include_bot_messages": False},
+            {"slack_channel_id": "C2", "include_bot_messages": True},
+        ]
         with patch(
             "main.get_slack_installation",
             return_value=install,
         ), patch(
-            "main.list_selected_channel_ids",
-            return_value=["C1", "C2"],
+            "main.list_selected_channel_settings",
+            return_value=channel_settings,
         ), patch(
             # Phase 4: the route resolves the workspace's HydraDB
             # sub-tenant before scheduling the runner. Patch this so
@@ -219,6 +223,7 @@ class TestRunIngest:
         assert kwargs["workspace_id"] == TEST_WS_ID
         assert kwargs["bot_token"] == "xoxb-test"
         assert kwargs["channel_ids"] == ["C1", "C2"]
+        assert kwargs["channel_bot_messages"] == {"C1": False, "C2": True}
         # Phase 4: the resolved sub_tenant_id must be forwarded.
         assert kwargs["hydradb_sub_tenant_id"] == "ws_test_abc"
 
@@ -258,8 +263,8 @@ class TestRunIngest:
             "main.get_slack_installation",
             return_value={"bot_token": "xoxb-test"},
         ), patch(
-            "main.list_selected_channel_ids",
-            return_value=["C1"],
+            "main.list_selected_channel_settings",
+            return_value=[{"slack_channel_id": "C1", "include_bot_messages": False}],
         ), patch(
             "main.ensure_workspace_sub_tenant",
             return_value=None,

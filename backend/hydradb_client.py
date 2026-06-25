@@ -64,6 +64,17 @@ def _post_recall(url: str, headers: dict, payload: dict) -> requests.Response:
     return requests.post(url, headers=headers, json=payload, timeout=60)
 
 
+# Retry-wrapped DELETE used by HydraDBClient.delete_knowledge.
+@retry(
+    service="hydradb",
+    max_attempts=3,
+    initial_delay=1.0,
+    retryable_exceptions=(requests.Timeout, requests.ConnectionError, OSError),
+)
+def _delete_request(url: str, headers: dict, payload: dict) -> requests.Response:
+    return requests.delete(url, headers=headers, json=payload, timeout=30)
+
+
 # ---------------------------------------------------------------------- #
 # Counting helper (shared by HydraDBClient.upload_knowledge and by the
 # CLI's upload_in_batches, so the per-batch print and the run-wide tally
@@ -254,6 +265,57 @@ class HydraDBClient:
         )
 
         return payload
+
+    # ------------------------------------------------------------------ #
+    # Deletion
+    # ------------------------------------------------------------------ #
+    def delete_knowledge(self, ids: List[str]) -> Dict[str, Any]:
+        """
+        Delete knowledge documents by their HydraDB-assigned source IDs.
+
+        `ids` are the values returned as `results[i].id` in the upload
+        response and stored as `source_id` in the ingestion state file.
+        Partial-success: each ID is reported independently in the response
+        `data.results[]`; one failure does not stop the rest.
+
+        Returns the parsed response dict on success, or {} on any failure.
+        Never raises — callers should treat {} as "delete may not have landed".
+        """
+        if not ids:
+            return {}
+        url = f"{self.base_url}/context"
+        payload = {
+            "tenant_id": self.tenant_id,
+            "sub_tenant_id": self.sub_tenant_id,
+            "ids": ids,
+            "type": "knowledge",
+        }
+        headers = {**self._auth_headers(), "Content-Type": "application/json"}
+        try:
+            resp = _delete_request(url, headers, payload)
+        except (requests.RequestException, RetryExhausted) as e:
+            logger.warning(
+                "hydradb_delete_network_error",
+                extra={"error": type(e).__name__, "id_count": len(ids)},
+            )
+            return {}
+        if resp.status_code >= 400:
+            logger.warning(
+                "hydradb_delete_http_error",
+                extra={"status": resp.status_code, "id_count": len(ids)},
+            )
+            return {}
+        try:
+            data = resp.json()
+        except ValueError:
+            logger.warning("hydradb_delete_non_json", extra={"status": resp.status_code})
+            return {}
+        deleted = (data.get("data") or {}).get("deleted_count") or 0
+        logger.info(
+            "hydradb_delete_complete",
+            extra={"deleted_count": deleted, "requested": len(ids)},
+        )
+        return data
 
     # ------------------------------------------------------------------ #
     # Retrieval

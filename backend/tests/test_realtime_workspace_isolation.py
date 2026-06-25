@@ -146,10 +146,13 @@ class TestProcessSlackEventRouting:
     """
 
     @pytest.fixture(autouse=True)
-    def _reset_seen_cache(self):
+    def _reset_seen_cache(self, monkeypatch):
         """Each test starts with a fresh in-memory dedupe cache."""
         import realtime_ingest as r
 
+        # Ensure realtime is enabled regardless of what the .env file says
+        # (the TestClient tests load .env which may have it disabled).
+        monkeypatch.setenv("REALTIME_INGEST_ENABLED", "true")
         r._seen_event_ids.clear()
         r._bot_user_id_by_token.clear()
         r._in_flight.clear()
@@ -222,8 +225,8 @@ class TestProcessSlackEventRouting:
             "realtime_ingest.get_slack_installation_by_team_id",
             return_value=installation,
         ), patch(
-            "realtime_ingest.is_channel_selected_for_workspace",
-            return_value=False,
+            "realtime_ingest.get_channel_ingest_settings",
+            return_value=None,
         ) as mock_sel, patch(
             "realtime_ingest.SlackClientWrapper",
         ) as mock_slack, patch(
@@ -267,8 +270,8 @@ class TestProcessSlackEventRouting:
             "realtime_ingest.get_slack_installation_by_team_id",
             return_value=installation,
         ), patch(
-            "realtime_ingest.is_channel_selected_for_workspace",
-            return_value=True,
+            "realtime_ingest.get_channel_ingest_settings",
+            return_value={"is_selected": True, "include_bot_messages": False},
         ), patch(
             "realtime_ingest.ensure_workspace_sub_tenant",
             return_value="ws_workspace_1",
@@ -327,17 +330,14 @@ class TestEventFiltering:
     @pytest.mark.parametrize(
         "subtype",
         [
-            "message_changed",
-            "message_deleted",
-            "bot_message",
             "channel_join",
             "channel_leave",
         ],
     )
     def test_ignored_subtypes_short_circuit_before_lookup(self, subtype):
-        """We drop edits/deletes/joins/leaves/bot_message BEFORE we even
-        hit Supabase -- no point looking up an installation for an
-        event we're going to ignore."""
+        """channel_join/channel_leave are noise and dropped BEFORE we hit
+        Supabase. bot_message is handled later (after channel selection) so
+        the per-channel include_bot_messages flag can be checked."""
         from realtime_ingest import process_slack_event
 
         payload = {

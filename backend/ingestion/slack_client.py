@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
-from retry import retry
+from retry import RetryExhausted, retry
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,10 @@ class SlackClientWrapper:
         self._user_name_cache: Dict[str, Optional[str]] = {}
         #   (channel_id, ts) -> permalink (or None when lookup failed)
         self._permalink_cache: Dict[tuple, Optional[str]] = {}
+        # Channels where Slack returned not_in_channel or channel_not_found
+        # during this run. Callers can inspect this after ingestion to update
+        # the channel's bot_removed flag in the database.
+        self.bot_removed_channels: set = set()
 
     # ------------------------------------------------------------------ #
     # Channel-level messages
@@ -98,6 +102,8 @@ class SlackClientWrapper:
                     )
                     self._sleep_for_retry(e)
                     continue
+                if err in ("not_in_channel", "channel_not_found"):
+                    self.bot_removed_channels.add(channel_id)
                 logger.warning(
                     'slack_api_error',
                     extra={
@@ -303,6 +309,46 @@ class SlackClientWrapper:
     )
     def _call_get_permalink(self, channel_id: str, message_ts: str):
         return self.client.chat_getPermalink(channel=channel_id, message_ts=message_ts)
+
+    # ------------------------------------------------------------------ #
+    # File info (requires files:read scope)
+    # ------------------------------------------------------------------ #
+    def fetch_file_info(self, file_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Return the 'file' dict from files.info for the given file_id.
+
+        Requires the files:read bot scope. Returns None on any error
+        (missing scope, not found, network failure) so callers treat
+        file preview as best-effort enrichment.
+        """
+        if not file_id:
+            return None
+        try:
+            response = self._call_files_info(file_id=file_id)
+            return response.get("file") or None
+        except SlackApiError as e:
+            err = e.response.get("error", str(e)) if getattr(e, "response", None) else str(e)
+            if err == "missing_scope":
+                logger.debug("slack_files_info_missing_scope", extra={"file_id": file_id})
+            else:
+                logger.warning(
+                    "slack_api_error",
+                    extra={"api": "files_info", "file_id": file_id, "error": err},
+                )
+            return None
+        except RetryExhausted:
+            logger.warning("slack_files_info_network_exhausted", extra={"file_id": file_id})
+            return None
+
+    @retry(
+        service="slack",
+        max_attempts=3,
+        initial_delay=1.0,
+        retryable_exceptions=(ConnectionError, TimeoutError, OSError),
+        retryable_status_codes=(),
+    )
+    def _call_files_info(self, file_id: str):
+        return self.client.files_info(file=file_id)
 
     # ------------------------------------------------------------------ #
     # Helpers

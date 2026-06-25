@@ -129,10 +129,12 @@ def topic_overview(
     # Group by (entity_type, content). content is case-insensitive
     # since the extractor sometimes captures "kafka" and "Kafka"
     # via different patterns.
-    key_of = lambda r: (
-        (r.get("entity_type") or "").strip().lower(),
-        (r.get("content") or "").strip().lower(),
-    )
+    def key_of(r):
+        return (
+            (r.get("entity_type") or "").strip().lower(),
+            (r.get("content") or "").strip().lower(),
+        )
+
     counts: Counter = Counter()
     first_seen: Dict[Tuple[str, str], str] = {}
     last_seen: Dict[Tuple[str, str], str] = {}

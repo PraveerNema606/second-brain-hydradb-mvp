@@ -215,9 +215,9 @@ def aggregate_query_stats(
         return out
     latencies: List[int] = []
     for ev in events:
-        l = ev.get("latency_ms")
-        if isinstance(l, int) and l >= 0:
-            latencies.append(l)
+        latency_ms = ev.get("latency_ms")
+        if isinstance(latency_ms, int) and latency_ms >= 0:
+            latencies.append(latency_ms)
         payload = ev.get("payload") or {}
         if payload.get("sources_count", 0) == 0:
             out["empty_result_count"] += 1

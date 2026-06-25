@@ -350,9 +350,7 @@ def build_alias_map(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         candidates = [m for m in multi if m[1][0] == first]
         if len(candidates) == 1:
             uf.union(single, candidates[0])
-            merge_rules[repr(candidates[0])].append(
-                {"alias": " ".join(single[1]), "rule": "first_name_unambiguous"}
-            )
+            merge_rules[repr(candidates[0])].append({"alias": " ".join(single[1]), "rule": "first_name_unambiguous"})
 
     # slack_id_adjacency: explicit "<@U…> (Name)" / "Name (<@U…>)"
     # evidence inside row content.
@@ -912,9 +910,7 @@ def build_conversation_reconstruction(
     if not needle or not rows:
         return empty
 
-    candidates = [
-        r for r in rows if r.get("kind") == "decision" and needle in (r.get("content") or "").lower()
-    ]
+    candidates = [r for r in rows if r.get("kind") == "decision" and needle in (r.get("content") or "").lower()]
     if not candidates:
         return empty
     # Most recent matching decision wins; deterministic tie-break on id.
@@ -964,7 +960,7 @@ def build_conversation_reconstruction(
             }
         )
     steps.sort(key=lambda s: (s["timestamp"] or "", str(s["content"])))
-    steps = steps[-max(1, min(int(limit or 20), 100)):]
+    steps = steps[-max(1, min(int(limit or 20), 100)) :]
 
     return {
         "decision": {
@@ -995,13 +991,19 @@ _INTENT_PATTERNS: List[Tuple[str, re.Pattern]] = [
         re.compile(r"\bwho\s+is\s+(?:responsible\s+for|the\s+owner\s+of)\s+(?P<subject>.{2,80})", re.IGNORECASE),
     ),
     ("ownership", re.compile(r"\bwho(?:'s|\s+is)\s+(?:working|leading)\s+on\s+(?P<subject>.{2,80})", re.IGNORECASE)),
-    ("status_blocker", re.compile(r"\bwhat(?:'s|\s+is)\s+(?:the\s+)?status\s+of\s+(?P<subject>.{2,80})", re.IGNORECASE)),
+    (
+        "status_blocker",
+        re.compile(r"\bwhat(?:'s|\s+is)\s+(?:the\s+)?status\s+of\s+(?P<subject>.{2,80})", re.IGNORECASE),
+    ),
     ("status_blocker", re.compile(r"\bwhat(?:'s|\s+is)\s+blocking\s+(?P<subject>.{2,80})", re.IGNORECASE)),
     ("status_blocker", re.compile(r"\b(?:any\s+)?blockers?\s+(?:for|on)\s+(?P<subject>.{2,80})", re.IGNORECASE)),
     ("status_blocker", re.compile(r"\bis\s+(?P<subject>.{2,60}?)\s+blocked\b", re.IGNORECASE)),
     (
         "decision_history",
-        re.compile(r"\bwhy\s+did\s+we\s+(?:decide(?:\s+(?:to|on))?|choose|pick|go\s+with)\s+(?P<subject>.{2,80})", re.IGNORECASE),
+        re.compile(
+            r"\bwhy\s+did\s+we\s+(?:decide(?:\s+(?:to|on))?|choose|pick|go\s+with)\s+(?P<subject>.{2,80})",
+            re.IGNORECASE,
+        ),
     ),
     (
         "decision_history",

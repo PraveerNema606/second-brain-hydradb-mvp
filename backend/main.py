@@ -22,6 +22,7 @@ Endpoints:
     GET    /api/slack/channels                            -> {"connected", "channels"}     (Supabase JWT + Workspace)
     POST   /api/slack/channels                            -> {"selected_count"}            (Supabase JWT + Workspace)
     POST   /api/slack/ingest                              -> {"status": "started"}         (Supabase JWT + Workspace)
+    DELETE /api/slack/disconnect                          -> {"disconnected": true}         (Supabase JWT + Workspace)
     GET    /api/admin/status                              -> ingestion status snapshot     (X-API-Key, legacy)
     POST   /slack/events                                  -> Slack Events API webhook      (Slack signature)
 
@@ -82,17 +83,17 @@ from errors import AppError, app_error_handler  # noqa: E402
 # clash with the Slack helpers above (both modules expose
 # build_connect_url, exchange_code, verify_oauth_state, etc.).
 from gmail_oauth import build_connect_url as gmail_build_connect_url  # noqa: E402
-from gmail_oauth import exchange_code as gmail_exchange_code
-from gmail_oauth import fetch_user_info as gmail_fetch_user_info
-from gmail_oauth import (
+from gmail_oauth import exchange_code as gmail_exchange_code  # noqa: E402
+from gmail_oauth import fetch_user_info as gmail_fetch_user_info  # noqa: E402
+from gmail_oauth import (  # noqa: E402
     gmail_oauth_configured,
 )
-from gmail_oauth import installation_from_token_response as gmail_installation_from_token_response
-from gmail_oauth import list_labels as list_gmail_labels_from_api
-from gmail_oauth import (
+from gmail_oauth import installation_from_token_response as gmail_installation_from_token_response  # noqa: E402
+from gmail_oauth import list_labels as list_gmail_labels_from_api  # noqa: E402
+from gmail_oauth import (  # noqa: E402
     run_workspace_gmail_ingest,
 )
-from gmail_oauth import verify_oauth_state as verify_gmail_oauth_state
+from gmail_oauth import verify_oauth_state as verify_gmail_oauth_state  # noqa: E402
 from health import router as health_router  # noqa: E402
 from llm import stream_grounded_answer  # noqa: E402
 from logging_config import configure_logging, get_logger  # noqa: E402
@@ -121,6 +122,7 @@ from slack_oauth import (  # noqa: E402
     exchange_code,
     installation_from_oauth_response,
     list_slack_channels,
+    revoke_bot_token,
     run_workspace_ingest,
     slack_oauth_configured,
     verify_oauth_state,
@@ -134,6 +136,7 @@ from supabase_client import (  # noqa: E402
     create_share_link,
     delete_gmail_connection,
     delete_saved_answer,
+    delete_slack_installation,
     ensure_workspace_sub_tenant,
     get_gmail_connection,
     get_gmail_connection_public,
@@ -147,6 +150,7 @@ from supabase_client import (  # noqa: E402
     list_gmail_labels,
     list_saved_answers,
     list_selected_channel_ids,
+    list_selected_channel_settings,
     list_selected_gmail_label_ids,
     list_share_links_for_workspace,
     list_user_workspaces,
@@ -1062,6 +1066,7 @@ class SlackChannelSelection(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     selected_channel_ids: List[str] = Field(default_factory=list)
+    bot_message_channel_ids: List[str] = Field(default_factory=list)
 
 
 # ---------- Phase 8: Gmail request models ---------- #
@@ -1912,6 +1917,7 @@ def slack_channels_save(
     ok = set_selected_channels(
         workspace_id=workspace.workspace_id,
         selected_ids=req.selected_channel_ids,
+        bot_message_ids=req.bot_message_channel_ids,
     )
     if not ok:
         raise HTTPException(
@@ -1952,14 +1958,16 @@ def slack_ingest(
             detail="Stored Slack installation is missing a bot token.",
         )
 
-    channel_ids = list_selected_channel_ids(
+    channel_settings = list_selected_channel_settings(
         workspace_id=workspace.workspace_id,
     )
-    if not channel_ids:
+    if not channel_settings:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No channels selected for ingestion.",
         )
+    channel_ids = [c["slack_channel_id"] for c in channel_settings]
+    channel_bot_messages = {c["slack_channel_id"]: c["include_bot_messages"] for c in channel_settings}
 
     # Phase 4: resolve (or lazy-create) the workspace's HydraDB
     # sub-tenant before scheduling the background task. A blank value
@@ -1980,12 +1988,44 @@ def slack_ingest(
         workspace_id=workspace.workspace_id,
         bot_token=bot_token,
         channel_ids=channel_ids,
+        channel_bot_messages=channel_bot_messages,
         hydradb_sub_tenant_id=sub_tenant,
     )
     return {
         "status": "started",
         "channels_queued": len(channel_ids),
     }
+
+
+@app.delete("/api/slack/disconnect")
+def slack_disconnect(
+    workspace: WorkspaceContext = Depends(require_workspace),
+) -> Dict[str, bool]:
+    """
+    Disconnect the Slack workspace: revoke the bot token with Slack,
+    then delete the installation row (cascades to channel records).
+
+    Token revocation is fire-and-forget — local cleanup proceeds even
+    if Slack's auth.revoke returns an error (e.g. token already expired).
+    """
+    install = get_slack_installation(workspace_id=workspace.workspace_id)
+    if not install:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No Slack connection found for this workspace.",
+        )
+
+    # Revoke with Slack first so the token can't be reused after we
+    # delete our local record.  Failure here is non-fatal.
+    revoke_bot_token(install.get("bot_token") or "")
+
+    deleted = delete_slack_installation(workspace_id=workspace.workspace_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not remove the Slack installation.",
+        )
+    return {"disconnected": True}
 
 
 # =====================================================================

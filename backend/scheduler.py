@@ -49,12 +49,13 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from gmail_oauth import run_workspace_gmail_ingest
 from logging_config import get_logger
-from retry import RetryExhausted, retry
-from slack_oauth import run_workspace_ingest
+from retry import RetryExhausted
+from slack_oauth import list_slack_channels, run_workspace_ingest
 from supabase_client import (
     list_active_workspaces_with_gmail,
     list_active_workspaces_with_slack,
     mark_workspace_synced,
+    upsert_slack_channels,
 )
 
 logger = get_logger(__name__)
@@ -104,8 +105,30 @@ def _slack_sweep() -> Dict[str, Any]:
     for ws in workspaces:
         workspace_id = ws.get("workspace_id") or ""
         bot_token = ws.get("bot_token") or ""
+        installation_id = ws.get("installation_id") or ""
         channel_ids = ws.get("channel_ids") or []
+        channel_bot_messages = ws.get("channel_bot_messages") or {}
         sub_tenant = (ws.get("hydradb_sub_tenant_id") or "").strip()
+
+        # Auto-discover new channels on every sweep so the user sees them
+        # in the picker without needing a manual refresh.
+        try:
+            fresh_channels = list_slack_channels(bot_token)
+            if fresh_channels:
+                upsert_slack_channels(
+                    workspace_id=workspace_id,
+                    channels=fresh_channels,
+                    installation_id=installation_id or None,
+                )
+                logger.debug(
+                    "scheduler_channels_refreshed",
+                    extra={"workspace_id": workspace_id, "count": len(fresh_channels)},
+                )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "scheduler_channel_refresh_failed",
+                extra={"workspace_id": workspace_id},
+            )
 
         if not channel_ids:
             # Connected but nothing selected -- nothing to ingest yet.
@@ -133,6 +156,7 @@ def _slack_sweep() -> Dict[str, Any]:
                 workspace_id=workspace_id,
                 bot_token=bot_token,
                 channel_ids=channel_ids,
+                channel_bot_messages=channel_bot_messages,
                 hydradb_sub_tenant_id=sub_tenant,
             )
         except Exception as e:  # noqa: BLE001

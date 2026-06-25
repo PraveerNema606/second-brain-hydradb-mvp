@@ -167,6 +167,13 @@ class IngestionState:
             "document_type": document_type,
         }
 
+    def remove(self, stable_key: str) -> bool:
+        """Remove a tracked entry. Returns True if it was present. Caller must save()."""
+        if stable_key in self.entries:
+            del self.entries[stable_key]
+            return True
+        return False
+
     # ----- lookups for recall ----------------------------------------- #
     def get(self, stable_key: str) -> Optional[Dict[str, Any]]:
         return self.entries.get(stable_key)

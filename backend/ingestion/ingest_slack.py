@@ -120,6 +120,38 @@ def _make_snippet(text: str, limit: int = 200) -> str:
 
 
 # ---------------------------------------------------------------------- #
+# File attachment helpers
+# ---------------------------------------------------------------------- #
+_FILE_PREVIEW_LIMIT = 2000
+
+
+def _collect_file_lines(
+    files: List[Dict[str, Any]],
+    slack: SlackClientWrapper,
+) -> List[str]:
+    """Return formatted lines for each file attachment in a message.
+
+    Calls files.info to get the plain_text preview (requires files:read scope).
+    Gracefully skips any file where the API call fails — preview is best-effort.
+    """
+    lines: List[str] = []
+    for f in files:
+        file_id = f.get("id")
+        if not file_id:
+            continue
+        name = f.get("name") or f.get("title") or file_id
+        permalink = f.get("permalink") or ""
+        info = slack.fetch_file_info(file_id) or {}
+        plain_text = (info.get("plain_text") or info.get("preview") or "").strip()
+        lines.append(f"[Attachment: {name}]")
+        if permalink:
+            lines.append(f"Link: {permalink}")
+        if plain_text:
+            lines.append(f"Preview:\n{plain_text[:_FILE_PREVIEW_LIMIT]}")
+    return lines
+
+
+# ---------------------------------------------------------------------- #
 # Document builders -> {"filename", "content", "stable_key", ...metadata}
 # ---------------------------------------------------------------------- #
 def build_message_file(
@@ -150,7 +182,11 @@ def build_message_file(
     if permalink:
         header_lines.append(f"Permalink: {permalink}")
 
-    content = "\n".join(header_lines + ["", text])
+    content_parts = header_lines + ["", text]
+    attachment_lines = _collect_file_lines(message.get("files") or [], slack)
+    if attachment_lines:
+        content_parts += ["", "Attachments:"] + attachment_lines
+    content = "\n".join(content_parts)
 
     filename = f"slack_{_safe_filename_part(channel_name)}_" f"msg_{_ts_for_filename(ts)}.md"
     return {
@@ -201,11 +237,16 @@ def build_thread_file(
     if permalink:
         header_lines.append(f"Permalink: {permalink}")
 
-    lines = header_lines + [
-        "",
-        "Parent:",
-        f"[{thread_ts}] {parent_user_name}: {parent_text}",
-    ]
+    parent_attachment_lines = _collect_file_lines(parent_message.get("files") or [], slack)
+    lines = (
+        header_lines
+        + [
+            "",
+            "Parent:",
+            f"[{thread_ts}] {parent_user_name}: {parent_text}",
+        ]
+        + parent_attachment_lines
+    )
     if real_replies:
         lines.append("")
         lines.append("Replies:")
@@ -216,6 +257,7 @@ def build_thread_file(
             )
             r_text = (reply.get("text") or "").strip()
             lines.append(f"[{r_ts}] {r_user_name}: {r_text}")
+            lines.extend(_collect_file_lines(reply.get("files") or [], slack))
 
     content = "\n".join(lines)
     filename = f"slack_{_safe_filename_part(channel_name)}_" f"thread_{_ts_for_filename(thread_ts)}.md"
@@ -244,6 +286,8 @@ def process_channel(
     channel_id: str,
     state: IngestionState,
     force: bool,
+    *,
+    include_bot_messages: bool = False,
 ) -> Dict[str, Any]:
     """
     Pull messages + threads for one channel, then split into:
@@ -293,6 +337,8 @@ def process_channel(
         if msg_ts and (newest_ts_seen is None or msg_ts > newest_ts_seen):
             newest_ts_seen = msg_ts
 
+        if message.get("subtype") == "bot_message" and not include_bot_messages:
+            continue
         if is_noise(message):
             continue
 

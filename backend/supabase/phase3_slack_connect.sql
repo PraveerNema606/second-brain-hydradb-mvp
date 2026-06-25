@@ -140,6 +140,10 @@ alter table public.slack_channels
   add column if not exists purpose         text    not null default '';
 alter table public.slack_channels
   add column if not exists last_seen_at    timestamptz;
+alter table public.slack_channels
+  add column if not exists bot_removed          boolean not null default false;
+alter table public.slack_channels
+  add column if not exists include_bot_messages boolean not null default false;
 
 -- The production schema also has UNIQUE(installation_id, slack_channel_id).
 -- Add it defensively for parity.

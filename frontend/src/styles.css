@@ -1771,6 +1771,25 @@ html, body, #root {
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
+.slack-settings__tag--warning {
+  background: var(--error-bg);
+  color: var(--error-text);
+}
+
+.slack-settings__bot-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.slack-settings__bot-toggle input[type="checkbox"] {
+  width: 11px;
+  height: 11px;
+  accent-color: var(--primary);
+  flex-shrink: 0;
+}
 
 .slack-settings__actions {
   display: flex;

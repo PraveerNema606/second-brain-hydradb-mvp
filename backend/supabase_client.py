@@ -849,6 +849,25 @@ def get_slack_installation_public(
     }
 
 
+def delete_slack_installation(*, workspace_id: str) -> bool:
+    """
+    Hard-delete the Slack installation for a workspace.
+    Cascades to slack_channels via FK (on delete cascade).
+    Returns True if a row was deleted, False if not found or on error.
+    """
+    try:
+        client = get_supabase()
+        resp = client.table("slack_installations").delete().eq("workspace_id", workspace_id).execute()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "supabase_delete_slack_installation_failed",
+            extra={"workspace_id": workspace_id, "error": type(e).__name__},
+        )
+        return False
+    rows = getattr(resp, "data", None) or []
+    return bool(rows)
+
+
 # ---------- slack_channels ------------------------------------------- #
 
 
@@ -980,7 +999,7 @@ def list_workspace_channels(
         client = get_supabase()
         resp = (
             client.table("slack_channels")
-            .select("slack_channel_id, name, is_selected, is_archived, " "updated_at")
+            .select("slack_channel_id, name, is_selected, is_archived, bot_removed, include_bot_messages, updated_at")
             .eq("workspace_id", workspace_id)
             .order("name", desc=False)
             .execute()
@@ -992,6 +1011,120 @@ def list_workspace_channels(
         )
         return []
     return list(getattr(resp, "data", []) or [])
+
+
+def mark_channel_bot_removed(
+    *,
+    workspace_id: str,
+    channel_id: str,
+    removed: bool,
+) -> None:
+    """
+    Set or clear the bot_removed flag on a single channel row.
+    No-ops silently if the channel isn't tracked yet (e.g. before the
+    first upsert_slack_channels call).
+    """
+    try:
+        client = get_supabase()
+        (
+            client.table("slack_channels")
+            .update({"bot_removed": removed})
+            .eq("workspace_id", workspace_id)
+            .eq("slack_channel_id", channel_id)
+            .execute()
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "supabase_mark_bot_removed_failed",
+            extra={
+                "workspace_id": workspace_id,
+                "channel_id": channel_id,
+                "removed": removed,
+                "error": type(e).__name__,
+            },
+        )
+
+
+def get_channel_ingest_settings(
+    *,
+    workspace_id: str,
+    slack_channel_id: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Return {is_selected, include_bot_messages} for one channel, or None
+    if the channel row doesn't exist yet.
+
+    Used by the realtime path to check selection and bot opt-in in one
+    query instead of two.
+    """
+    if not workspace_id or not slack_channel_id:
+        return None
+    try:
+        client = get_supabase()
+        resp = (
+            client.table("slack_channels")
+            .select("is_selected, include_bot_messages")
+            .eq("workspace_id", workspace_id)
+            .eq("slack_channel_id", slack_channel_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "supabase_get_channel_settings_failed",
+            extra={
+                "workspace_id": workspace_id,
+                "slack_channel_id": slack_channel_id,
+                "error": type(e).__name__,
+            },
+        )
+        return None
+    rows = getattr(resp, "data", None) or []
+    if not rows:
+        return None
+    return {
+        "is_selected": bool(rows[0].get("is_selected")),
+        "include_bot_messages": bool(rows[0].get("include_bot_messages")),
+    }
+
+
+def list_selected_channel_settings(
+    *,
+    workspace_id: str,
+) -> List[Dict[str, Any]]:
+    """
+    Return [{slack_channel_id, include_bot_messages}] for every channel
+    marked is_selected=True in the workspace.
+
+    Used by the ingest route and scheduler to build the channel list and
+    per-channel bot-message settings in one query.
+    """
+    try:
+        client = get_supabase()
+        resp = (
+            client.table("slack_channels")
+            .select("slack_channel_id, include_bot_messages")
+            .eq("workspace_id", workspace_id)
+            .eq("is_selected", True)
+            .execute()
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "supabase_list_selected_channel_settings_failed",
+            extra={"workspace_id": workspace_id, "error": type(e).__name__},
+        )
+        return []
+    out: List[Dict[str, Any]] = []
+    for row in getattr(resp, "data", None) or []:
+        cid = (row.get("slack_channel_id") or "").strip()
+        if cid:
+            out.append(
+                {
+                    "slack_channel_id": cid,
+                    "include_bot_messages": bool(row.get("include_bot_messages")),
+                }
+            )
+    return out
 
 
 def list_selected_channel_ids(
@@ -1029,15 +1162,20 @@ def set_selected_channels(
     *,
     workspace_id: str,
     selected_ids: List[str],
+    bot_message_ids: Optional[List[str]] = None,
 ) -> bool:
     """
-    Replace the selected set. Sets is_selected=true on every row whose
-    slack_channel_id appears in `selected_ids`, and is_selected=false
-    on every other row in the workspace. Channel rows must already exist
-    (upserted by the previous /api/slack/channels GET) — this function
-    intentionally does NOT create missing rows.
+    Replace the selected set and, optionally, the per-channel bot-message
+    opt-in. Sets is_selected=true on every row whose slack_channel_id
+    appears in `selected_ids`, is_selected=false on every other row.
 
-    Returns True on success, False on any failure.
+    When `bot_message_ids` is provided (including an empty list), the same
+    pattern applies: include_bot_messages=true for channels in the list,
+    false for all others. When omitted, include_bot_messages is untouched.
+
+    Channel rows must already exist (upserted by the previous
+    /api/slack/channels GET) — this function intentionally does NOT create
+    missing rows. Returns True on success, False on any failure.
     """
     try:
         client = get_supabase()
@@ -1060,6 +1198,24 @@ def set_selected_channels(
         else:
             # Empty selection — unselect everything.
             client.table("slack_channels").update({"is_selected": False}).eq("workspace_id", workspace_id).execute()
+
+        if bot_message_ids is not None:
+            # Only set include_bot_messages=True for channels that are also
+            # selected, so unselected channels can never carry a stale True.
+            selected_set = set(selected_ids)
+            effective_bot_ids = [cid for cid in bot_message_ids if cid in selected_set]
+            if effective_bot_ids:
+                client.table("slack_channels").update({"include_bot_messages": True}).eq(
+                    "workspace_id", workspace_id
+                ).in_("slack_channel_id", effective_bot_ids).execute()
+                client.table("slack_channels").update({"include_bot_messages": False}).eq(
+                    "workspace_id", workspace_id
+                ).not_.in_("slack_channel_id", effective_bot_ids).execute()
+            else:
+                client.table("slack_channels").update({"include_bot_messages": False}).eq(
+                    "workspace_id", workspace_id
+                ).execute()
+
     except Exception as e:  # noqa: BLE001
         logger.warning(
             'supabase_set_selected_channels_failed',
@@ -1231,23 +1387,33 @@ def list_active_workspaces_with_slack() -> List[Dict[str, Any]]:
         # We deliberately fetch ALL installations (not filtered to the
         # active workspace ids above) — the Slack installations table
         # is small and a single round-trip beats N queries.
-        inst_resp = client.table("slack_installations").select("workspace_id, bot_token").execute()
-        installations = {
-            (row.get("workspace_id") or ""): (row.get("bot_token") or "")
-            for row in (getattr(inst_resp, "data", None) or [])
-        }
+        inst_resp = client.table("slack_installations").select("id, workspace_id, bot_token").execute()
+        installations: Dict[str, Dict[str, str]] = {}
+        for row in getattr(inst_resp, "data", None) or []:
+            wid_key = (row.get("workspace_id") or "").strip()
+            if wid_key:
+                installations[wid_key] = {
+                    "bot_token": (row.get("bot_token") or "").strip(),
+                    "installation_id": (row.get("id") or "").strip(),
+                }
 
-        # Same for the selected channels.
+        # Same for the selected channels (include include_bot_messages for
+        # the ingestion runner to pass through to process_channel).
         chan_resp = (
-            client.table("slack_channels").select("workspace_id, slack_channel_id").eq("is_selected", True).execute()
+            client.table("slack_channels")
+            .select("workspace_id, slack_channel_id, include_bot_messages")
+            .eq("is_selected", True)
+            .execute()
         )
         channels_by_ws: Dict[str, List[str]] = {}
+        bot_messages_by_ws: Dict[str, Dict[str, bool]] = {}
         for row in getattr(chan_resp, "data", None) or []:
             ws = row.get("workspace_id") or ""
             cid = (row.get("slack_channel_id") or "").strip()
             if not ws or not cid:
                 continue
             channels_by_ws.setdefault(ws, []).append(cid)
+            bot_messages_by_ws.setdefault(ws, {})[cid] = bool(row.get("include_bot_messages"))
     except Exception as e:  # noqa: BLE001
         logger.warning(
             'supabase_list_active_workspaces_failed',
@@ -1258,7 +1424,9 @@ def list_active_workspaces_with_slack() -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for ws in all_workspaces:
         wid = ws.get("id")
-        token = installations.get(wid)
+        install = installations.get(wid) or {}
+        token = install.get("bot_token") or ""
+        install_id = install.get("installation_id") or ""
         sub_tenant = (ws.get("hydradb_sub_tenant_id") or "").strip()
         if not wid or not token or not sub_tenant:
             # Skip workspaces without Slack connected or without a
@@ -1270,7 +1438,9 @@ def list_active_workspaces_with_slack() -> List[Dict[str, Any]]:
                 "workspace_id": wid,
                 "hydradb_sub_tenant_id": sub_tenant,
                 "bot_token": token,
+                "installation_id": install_id,
                 "channel_ids": channels_by_ws.get(wid, []),
+                "channel_bot_messages": bot_messages_by_ws.get(wid, {}),
             }
         )
     return out
