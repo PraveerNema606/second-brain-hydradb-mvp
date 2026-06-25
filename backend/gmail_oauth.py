@@ -1929,6 +1929,19 @@ def _materialize_gmail_thread(
         return
 
     ok, _bad = summarize_upload_response(response if isinstance(response, dict) else {}, batch_size=1)
+    # DIAGNOSTIC (instrumentation only): the per-thread upload outcome.
+    # ok=0 with non-empty raw_keys => HydraDB rejected the write (4xx/5xx
+    # body); ok=0 with raw_keys=[] => empty {} from a network/RetryExhausted
+    # failure (see hydradb_client.upload_knowledge). ok>=1 => write accepted.
+    logger.info(
+        "gmail_thread_upload_result",
+        extra={
+            "thread_id": thread_id,
+            "ok": ok,
+            "bad": _bad,
+            "raw_keys": list(response.keys()) if isinstance(response, dict) else None,
+        },
+    )
     if not ok:
         summary["threads_failed"] += 1
         summary["messages_failed"] += len(messages)
@@ -2399,6 +2412,23 @@ def run_workspace_gmail_ingest(
         affected_thread_ids = [
             t for t in affected_thread_ids if t and t not in seen_thread_ids_this_run
         ]
+
+        # DIAGNOSTIC (instrumentation only): how many threads this label
+        # resolved to, and the sub-tenant we will write them into. Lets us
+        # distinguish "zero threads materialized" from "threads found but
+        # uploads failing", and compare the ingest sub-tenant against the
+        # recall sub-tenant (recall_corpus_probe).
+        logger.info(
+            "gmail_ingest_label_threads",
+            extra={
+                "workspace_id": workspace_id,
+                "connection_id": connection_id,
+                "label_id": label_id,
+                "sub_tenant": hydradb_sub_tenant_id,
+                "mode": effective_label_mode,
+                "thread_count": len(affected_thread_ids),
+            },
+        )
 
         # Materialize each affected thread. The per-run budget (`remaining`)
         # is now a THREAD budget: one consolidated document per thread.

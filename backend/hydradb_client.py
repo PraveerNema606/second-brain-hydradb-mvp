@@ -224,12 +224,23 @@ class HydraDBClient:
             return {}
 
         level = logging.DEBUG if response.status_code < 400 else logging.WARNING
+        # DIAGNOSTIC (instrumentation only): surface the write sub-tenant and
+        # a short response-body preview so a silent upload rejection (4xx/5xx
+        # body) is visible and attributable to the correct sub-tenant. No
+        # behavior change -- still returns {} on >=400 below.
+        try:
+            _resp_preview = (response.text or "")[:300]
+        except Exception:  # noqa: BLE001
+            _resp_preview = "<unavailable>"
         logger.log(
             level,
             'hydradb_upload_response',
             extra={
                 'http_status': response.status_code,
+                'status_code': response.status_code,
+                'sub_tenant': self.sub_tenant_id,
                 'file_count': len(files),
+                'response_preview': _resp_preview,
             },
         )
 

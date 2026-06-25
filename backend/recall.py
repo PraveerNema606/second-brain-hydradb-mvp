@@ -1120,6 +1120,19 @@ def prepare_recall_context(
     effective_top_k = max(top_k, _RECENCY_CANDIDATE_POOL) if recency_intent else top_k
     raw_response = hydra.full_recall(query=question, top_k=effective_top_k)
     chunks = _extract_chunks(raw_response)
+    # DIAGNOSTIC (instrumentation only): the sub-tenant recall actually
+    # queried and how many chunks HydraDB returned. Compare `sub_tenant`
+    # against the ingest-side gmail_ingest_label_threads log to catch a
+    # write/read sub-tenant mismatch; chunks_returned=0 confirms an empty
+    # corpus for this query.
+    logger.info(
+        "recall_corpus_probe",
+        extra={
+            "workspace_id": workspace_id,
+            "sub_tenant": hydradb_sub_tenant_id,
+            "chunks_returned": len(chunks),
+        },
+    )
     debug_on = _debug_recall_enabled()
 
     if debug_on:
