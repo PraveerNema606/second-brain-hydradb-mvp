@@ -96,7 +96,7 @@ from gmail_oauth import verify_oauth_state as verify_gmail_oauth_state  # noqa: 
 from health import router as health_router  # noqa: E402
 from llm import stream_grounded_answer  # noqa: E402
 from logging_config import configure_logging, get_logger  # noqa: E402
-from prompts import INSUFFICIENT_CONTEXT_ANSWER  # noqa: E402
+from prompts import INSUFFICIENT_CONTEXT_ANSWER, is_insufficient_context_answer  # noqa: E402
 from query_cache import build_cache_key, get_cached  # noqa: E402
 from query_cache import put as cache_put  # noqa: E402
 from query_rewriter import rewrite_query  # noqa: E402
@@ -745,7 +745,7 @@ def query(
     # was found) AND there's no conversation history. Don't cache the
     # fallback string either — letting it retry next time is harmless
     # and the answer might change after fresh ingestion.
-    if use_cache and result.get("answer") and result["answer"] != INSUFFICIENT_CONTEXT_ANSWER:
+    if use_cache and result.get("answer") and not is_insufficient_context_answer(result["answer"]):
         cache_put(cache_key, result)
     return result
 
@@ -866,20 +866,25 @@ def query_stream(
             return
 
         if not prepared["ready"]:
-            # No context found — emit the canonical fallback as one token,
-            # then done. This keeps the frontend's state machine simple.
-            yield _sse_event("token", {"text": INSUFFICIENT_CONTEXT_ANSWER})
-            fallback_debug = {**prepared["fallback_debug"], "cache_hit": False}
+            # No context found — emit the outcome-specific fallback as
+            # one token, then done. Keeps the frontend state machine simple
+            # while surfacing accurate retrieval diagnostics on `done`.
+            fallback_debug = {**(prepared.get("fallback_debug") or {}), "cache_hit": False}
+            fallback_answer = (
+                fallback_debug.get("answer")
+                or INSUFFICIENT_CONTEXT_ANSWER
+            )
             if date_query_debug is not None:
                 fallback_debug["date_query"] = date_query_debug
             if rewrite_debug is not None:
                 fallback_debug["query_rewrite"] = rewrite_debug
             if history:
                 fallback_debug["cache_bypassed"] = "conversation_history present"
+            yield _sse_event("token", {"text": fallback_answer})
             yield _sse_event(
                 "done",
                 {
-                    "answer": INSUFFICIENT_CONTEXT_ANSWER,
+                    "answer": fallback_answer,
                     "sources": [],
                     "debug": fallback_debug,
                 },
@@ -941,7 +946,18 @@ def query_stream(
             "cache_hit": False,
             "history_used": bool(history),
             "history_turns": len(history),
+            "filters_relaxed": bool(prepared.get("filters_relaxed")),
+            "retrieval": prepared.get("retrieval"),
+            "retrieval_outcome": (prepared.get("retrieval") or {}).get("outcome"),
         }
+        if is_insufficient_context_answer(finalized["answer"]):
+            debug["retrieval_outcome"] = "llm_refusal"
+            if isinstance(debug.get("retrieval"), dict):
+                debug["retrieval"] = {
+                    **debug["retrieval"],
+                    "outcome": "llm_refusal",
+                    "reason": "LLM refused despite retrieved context",
+                }
         if date_query_debug is not None:
             debug["date_query"] = date_query_debug
         if rewrite_debug is not None:
@@ -956,9 +972,9 @@ def query_stream(
         yield _sse_event("done", full_payload)
 
         # Cache the finalized result for next identical request, same
-        # rules as /api/query: only when stateless AND not the no-context
-        # fallback.
-        if use_cache and full_payload["answer"] and full_payload["answer"] != INSUFFICIENT_CONTEXT_ANSWER:
+        # rules as /api/query: only when stateless AND not an
+        # insufficient-context answer.
+        if use_cache and full_payload["answer"] and not is_insufficient_context_answer(full_payload["answer"]):
             cache_put(cache_key, full_payload)
 
     return StreamingResponse(

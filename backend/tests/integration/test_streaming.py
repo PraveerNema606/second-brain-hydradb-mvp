@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 AUTH = {"X-API-Key": "test-secret-key"}
-INSUFFICIENT = "I do not have enough Slack context to answer that."
+INSUFFICIENT = "I do not have enough context to answer that."
 
 
 def _parse_sse(text: str):

@@ -25,7 +25,16 @@ from hydradb_client import HydraDBClient, require_sub_tenant_id
 from ingestion.ingestion_state import IngestionState
 from llm import generate_grounded_answer
 from logging_config import get_logger
-from prompts import INSUFFICIENT_CONTEXT_ANSWER
+from prompts import (
+    INSUFFICIENT_CONTEXT_ANSWER,
+    OUTCOME_EMPTY_CORPUS,
+    OUTCOME_FILTERED_OUT,
+    OUTCOME_LLM_REFUSAL,
+    OUTCOME_NO_USABLE_TEXT,
+    OUTCOME_OK,
+    answer_for_retrieval_outcome,
+    is_insufficient_context_answer,
+)
 
 logger = get_logger(__name__)
 
@@ -1031,6 +1040,76 @@ def _rerank_by_recency(
     return eligible[:top_k]
 
 
+def _build_retrieval_diagnostics(
+    *,
+    outcome: str,
+    chunks_returned: int,
+    chunks_filtered_out: int,
+    extractable_count: int,
+    filters_relaxed: bool,
+    filters_applied: Dict[str, Any],
+    reason: str,
+) -> Dict[str, Any]:
+    """Compact, structured retrieval diagnostics for the API debug blob."""
+    return {
+        "outcome": outcome,
+        "reason": reason,
+        "chunks_returned": chunks_returned,
+        "chunks_extractable": extractable_count,
+        "chunks_filtered_out": chunks_filtered_out,
+        "filters_relaxed": filters_relaxed,
+        "filters_applied": filters_applied,
+    }
+
+
+def _gather_hydra_candidates(
+    chunks: List[Any],
+    state: Optional[IngestionState],
+    *,
+    channel: Optional[str],
+    user: Optional[str],
+    document_type: Optional[str],
+    start_unix: Optional[float],
+    end_unix: Optional[float],
+    allowed_sources: Optional[List[str]],
+) -> Tuple[List[Dict[str, Any]], int, int]:
+    """
+    Extract text + source cards from HydraDB chunks and apply hard filters.
+
+    Returns (candidates, filtered_out_count, extractable_before_filter).
+    """
+    candidates: List[Dict[str, Any]] = []
+    filtered_out = 0
+    extractable = 0
+    for original_index, chunk in enumerate(chunks, start=1):
+        text = _chunk_text(chunk).strip()
+        if not text:
+            continue
+        extractable += 1
+        score = _chunk_score(chunk)
+        source_card = _build_source_card(chunk, original_index, score, state)
+        if not _source_passes_filters(
+            source_card,
+            channel,
+            user,
+            document_type,
+            start_unix,
+            end_unix,
+            allowed_sources=allowed_sources,
+        ):
+            filtered_out += 1
+            continue
+        candidates.append(
+            {
+                "text": text,
+                "source_card": source_card,
+                "original_index": original_index,
+                "timestamp_float": _coerce_to_unix_seconds(source_card.get("timestamp")),
+            }
+        )
+    return candidates, filtered_out, extractable
+
+
 def prepare_recall_context(
     question: str,
     top_k: int,
@@ -1160,43 +1239,34 @@ def prepare_recall_context(
     end_unix = _coerce_to_unix_seconds(end_timestamp)
     query_terms = extract_query_terms(question) if mode in ("exact", "hybrid") else []
 
+    filters_applied: Dict[str, Any] = {
+        "channel": channel,
+        "user": user,
+        "document_type": document_type,
+        "start_timestamp": start_unix,
+        "end_timestamp": end_unix,
+        "allowed_sources": normalized_sources,
+    }
+    # Channel / person / date / document_type are often rewriter-inferred
+    # hard filters. When they wipe an otherwise non-empty candidate set we
+    # retry once without them. allowed_sources stays — that is an explicit
+    # user connector choice from the UI.
+    relaxable_filters_active = bool(
+        channel or user or document_type or start_unix is not None or end_unix is not None
+    )
+
     # ---- Step 1: gather per-chunk metadata for ranking ----
-    # We build a parallel list of {text, source_card, original_index,
-    # timestamp_float, hits(_)}. Filters drop chunks before ranking so
-    # the rerank operates only on the candidate set the user actually
-    # wants.
-    chunks_with_meta: List[Dict[str, Any]] = []
-    filtered_out = 0
-    for original_index, chunk in enumerate(chunks, start=1):
-        text = _chunk_text(chunk).strip()
-        if not text:
-            continue
-        score = _chunk_score(chunk)
-        # The 'index' we initially put on the card is the HydraDB order.
-        # We'll renumber after reranking so the cards line up with the
-        # [N] labels the LLM sees.
-        source_card = _build_source_card(chunk, original_index, score, state)
-
-        if not _source_passes_filters(
-            source_card,
-            channel,
-            user,
-            document_type,
-            start_unix,
-            end_unix,
-            allowed_sources=normalized_sources,
-        ):
-            filtered_out += 1
-            continue
-
-        chunks_with_meta.append(
-            {
-                "text": text,
-                "source_card": source_card,
-                "original_index": original_index,
-                "timestamp_float": _coerce_to_unix_seconds(source_card.get("timestamp")),
-            }
-        )
+    chunks_with_meta, filtered_out, extractable_count = _gather_hydra_candidates(
+        chunks,
+        state,
+        channel=channel,
+        user=user,
+        document_type=document_type,
+        start_unix=start_unix,
+        end_unix=end_unix,
+        allowed_sources=normalized_sources,
+    )
+    filters_relaxed = False
 
     # ---- Step 1.5: fold structured memory candidates into the pool ----
     # Phase 12: extracted memories (action items, decisions, summaries,
@@ -1209,18 +1279,14 @@ def prepare_recall_context(
     # decision outranking today's Slack message when the user asks
     # "latest message"). The memory layer fails gracefully: a Supabase
     # outage degrades to no memories but never blocks the answer.
-    memory_candidates: List[Dict[str, Any]] = []
-    if workspace_id and not recency_intent:
+    def _load_memory_candidates(start_index: int) -> List[Dict[str, Any]]:
+        if not workspace_id or recency_intent:
+            return []
         try:
-            # Defer the import so the test suite can mock at the
-            # memory_store boundary without forcing this module to
-            # eagerly construct a Supabase client at import time.
             from memory_store import list_memories  # noqa: PLC0415
 
             memory_rows = list_memories(
                 workspace_id=workspace_id,
-                # Pull from every kind by default; the question-text
-                # filter narrows down to relevant content.
                 query=question.strip() or None,
                 limit=10,
             )
@@ -1232,18 +1298,10 @@ def prepare_recall_context(
                     "error": type(e).__name__,
                 },
             )
-            memory_rows = []
-        # Phase 16: derive an importance score per memory row
-        # (recurrence + recency + owner-presence + cluster-size) so
-        # important memories carry a higher card score than the old
-        # flat 0.5. Defensive: any failure inside the importance
-        # computation degrades to the legacy 0.5 baseline so memory
-        # injection itself can never break.
+            return []
         importance_by_id: Dict[Any, float] = {}
         if memory_rows:
             try:
-                # Deferred import for the same reason as memory_store
-                # above: tests mock at this module boundary.
                 from memory_intelligence import compute_memory_importance  # noqa: PLC0415
 
                 importance_by_id = compute_memory_importance(memory_rows) or {}
@@ -1256,7 +1314,7 @@ def prepare_recall_context(
                     },
                 )
                 importance_by_id = {}
-        memory_start_index = len(chunks_with_meta) + 1
+        out: List[Dict[str, Any]] = []
         for offset, row in enumerate(memory_rows):
             content = (row.get("content") or "").strip()
             if not content:
@@ -1266,23 +1324,13 @@ def prepare_recall_context(
             source_stable_key = row.get("source_stable_key") or ""
             source_ts = row.get("source_timestamp")
             ts_float = _coerce_to_unix_seconds(source_ts) if source_ts else None
-            # Phase 16: importance-aware score. When the importance
-            # computation succeeded for this row, scale it into
-            # [0.3, 1.0]; otherwise keep the legacy neutral 0.5 so
-            # pre-Phase-16 behavior (and its tests) is preserved.
             _imp = importance_by_id.get(row.get("id"))
             if isinstance(_imp, (int, float)) and 0.0 <= float(_imp) <= 1.0:
                 memory_score = round(0.3 + 0.7 * float(_imp), 6)
             else:
-                memory_score = 0.5  # neutral semantic baseline
-            # Build a memory-flavored source card. The `source_kind`
-            # field carries the ORIGINAL connector ("slack"/"gmail")
-            # so existing source-filter logic keeps working --
-            # asking for slack-only correctly includes Slack-derived
-            # memories. We also stamp `memory_kind` for downstream
-            # consumers / log lines.
+                memory_score = 0.5
             card: Dict[str, Any] = {
-                "index": memory_start_index + offset,
+                "index": start_index + offset,
                 "source": source_stable_key or f"memory:{kind}",
                 "score": memory_score,
                 "stable_key": source_stable_key,
@@ -1294,9 +1342,6 @@ def prepare_recall_context(
                 "owner": row.get("owner") or None,
                 "entity_type": row.get("entity_type") or None,
             }
-            # Friendly LLM-facing text: prepend a small kind tag so
-            # the model knows it's reading structured memory and not
-            # raw conversation.
             prefix = {
                 "action_item": "Action item",
                 "decision": "Decision",
@@ -1305,7 +1350,7 @@ def prepare_recall_context(
             }.get(kind, "Memory")
             owner = card.get("owner")
             text_block = f"[{prefix}{' (owner: ' + owner + ')' if owner else ''}] " f"{content}"
-            memory_candidates.append(
+            out.append(
                 {
                     "text": text_block,
                     "source_card": card,
@@ -1313,28 +1358,88 @@ def prepare_recall_context(
                     "timestamp_float": ts_float,
                 }
             )
+        return out
 
-    if memory_candidates:
-        # Apply the same workspace-scoped filters (channel/user/etc.)
-        # to memory candidates. Most memories carry no `channel` so
-        # the don't-silently-drop rule lets them through any channel
-        # filter; the source filter does honor them (e.g. slack-only
-        # gets memory rows where source_kind=="slack").
+    def _apply_memory_filters(
+        memory_candidates: List[Dict[str, Any]],
+        *,
+        channel_f: Optional[str],
+        user_f: Optional[str],
+        document_type_f: Optional[str],
+        start_f: Optional[float],
+        end_f: Optional[float],
+    ) -> Tuple[List[Dict[str, Any]], int]:
         kept: List[Dict[str, Any]] = []
+        dropped = 0
         for mc in memory_candidates:
             if _source_passes_filters(
                 mc["source_card"],
-                channel,
-                user,
-                document_type,
-                start_unix,
-                end_unix,
+                channel_f,
+                user_f,
+                document_type_f,
+                start_f,
+                end_f,
                 allowed_sources=normalized_sources,
             ):
                 kept.append(mc)
             else:
-                filtered_out += 1
+                dropped += 1
+        return kept, dropped
+
+    memory_candidates = _load_memory_candidates(start_index=len(chunks_with_meta) + 1)
+    if memory_candidates:
+        kept, mem_dropped = _apply_memory_filters(
+            memory_candidates,
+            channel_f=channel,
+            user_f=user,
+            document_type_f=document_type,
+            start_f=start_unix,
+            end_f=end_unix,
+        )
+        filtered_out += mem_dropped
         chunks_with_meta.extend(kept)
+
+    # Phase 2: if hard (relaxable) filters wiped every extractable Hydra
+    # chunk, retry once without those filters so rewriter false positives
+    # don't produce empty-context answers.
+    if (
+        not chunks_with_meta
+        and extractable_count > 0
+        and relaxable_filters_active
+    ):
+        logger.info(
+            "recall_filters_relaxed_retry",
+            extra={
+                "workspace_id": workspace_id,
+                "filtered_out": filtered_out,
+                "extractable": extractable_count,
+                "filters": {k: v for k, v in filters_applied.items() if v is not None},
+            },
+        )
+        chunks_with_meta, _ignored_filtered, _ = _gather_hydra_candidates(
+            chunks,
+            state,
+            channel=None,
+            user=None,
+            document_type=None,
+            start_unix=None,
+            end_unix=None,
+            allowed_sources=normalized_sources,
+        )
+        filters_relaxed = True
+        # Re-apply memories without the relaxed filters (keep allowed_sources).
+        memory_candidates = _load_memory_candidates(start_index=len(chunks_with_meta) + 1)
+        if memory_candidates:
+            kept, mem_dropped = _apply_memory_filters(
+                memory_candidates,
+                channel_f=None,
+                user_f=None,
+                document_type_f=None,
+                start_f=None,
+                end_f=None,
+            )
+            filtered_out += mem_dropped
+            chunks_with_meta.extend(kept)
 
     # Same Slack message that resurfaces twice in recall shouldn't get
     # twice the ranking boost.
@@ -1372,6 +1477,7 @@ def prepare_recall_context(
             'filtered_out': filtered_out,
             'mode': retrieval_mode_effective,
             'recency_intent': recency_intent,
+            'filters_relaxed': filters_relaxed,
             'top_k': top_k,
         },
     )
@@ -1407,10 +1513,49 @@ def prepare_recall_context(
         )
 
     if not ranked:
+        if len(chunks) == 0:
+            outcome = OUTCOME_EMPTY_CORPUS
+            reason = (
+                "HydraDB returned no chunks for this workspace sub-tenant "
+                "(empty corpus, indexing lag, or query mismatch)"
+            )
+        elif extractable_count == 0:
+            outcome = OUTCOME_NO_USABLE_TEXT
+            reason = "no usable text found in HydraDB chunks"
+        elif filtered_out > 0 and not filters_relaxed:
+            outcome = OUTCOME_FILTERED_OUT
+            reason = (
+                "all extractable chunks were removed by hard filters "
+                "(channel/user/date/document_type/allowed_sources)"
+            )
+        elif filtered_out > 0 and filters_relaxed:
+            # Relaxed retry still empty — usually allowed_sources or
+            # text/rank edge cases after the rewriter filters were cleared.
+            outcome = OUTCOME_FILTERED_OUT
+            reason = (
+                "chunks remained empty after relaxing channel/user/date/"
+                "document_type filters (remaining filters or ranking)"
+            )
+        else:
+            outcome = OUTCOME_NO_USABLE_TEXT
+            reason = "no usable text found in HydraDB chunks"
+
         first_chunk = chunks[0] if chunks else None
         first_chunk_keys = list(first_chunk.keys()) if isinstance(first_chunk, dict) else None
+        diagnostics = _build_retrieval_diagnostics(
+            outcome=outcome,
+            chunks_returned=len(chunks),
+            chunks_filtered_out=filtered_out,
+            extractable_count=extractable_count,
+            filters_relaxed=filters_relaxed,
+            filters_applied=filters_applied,
+            reason=reason,
+        )
         debug_payload: Dict[str, Any] = {
-            "reason": "no usable text found in HydraDB chunks",
+            "reason": reason,
+            "retrieval_outcome": outcome,
+            "retrieval": diagnostics,
+            "answer": answer_for_retrieval_outcome(outcome),
             "raw_response_keys": (list(raw_response.keys()) if isinstance(raw_response, dict) else None),
             "chunks_returned": len(chunks),
             "chunks_filtered_out": filtered_out,
@@ -1419,6 +1564,7 @@ def prepare_recall_context(
             "exact_matches_found": 0,
             "query_terms": query_terms,
             "top_k": top_k,
+            "filters_relaxed": filters_relaxed,
         }
         if debug_on and first_chunk is not None:
             debug_payload["first_chunk_preview"] = _first_chunk_preview(first_chunk)
@@ -1435,6 +1581,15 @@ def prepare_recall_context(
         context_blocks.append(f"[{i}] (source: {context_label})\n{text}")
         sources.append(card)
 
+    diagnostics = _build_retrieval_diagnostics(
+        outcome=OUTCOME_OK,
+        chunks_returned=len(chunks),
+        chunks_filtered_out=filtered_out,
+        extractable_count=extractable_count,
+        filters_relaxed=filters_relaxed,
+        filters_applied=filters_applied,
+        reason="context ready",
+    )
     return {
         "ready": True,
         "context_text": "\n\n".join(context_blocks),
@@ -1445,6 +1600,8 @@ def prepare_recall_context(
         "retrieval_mode": retrieval_mode_effective,
         "query_terms": query_terms,
         "fallback_debug": None,
+        "filters_relaxed": filters_relaxed,
+        "retrieval": diagnostics,
         # Phase 10: internal-only ranking breakdown for logs and
         # tests. Never forwarded to the public API response (main.py
         # builds its debug shape field-by-field rather than spreading
@@ -1560,27 +1717,31 @@ def answer_question(
     if not prepared["ready"]:
         # Phase 15: emit retrieval_failure so the analytics view can
         # surface empty-result patterns over time.
+        fallback_debug = dict(prepared.get("fallback_debug") or {})
+        outcome = str(fallback_debug.get("retrieval_outcome") or OUTCOME_NO_USABLE_TEXT)
+        user_answer = fallback_debug.get("answer") or answer_for_retrieval_outcome(outcome)
         if workspace_id:
             try:
                 from analytics_store import emit_event  # noqa: PLC0415
 
-                fallback_debug = prepared.get("fallback_debug") or {}
                 emit_event(
                     workspace_id=workspace_id,
                     kind="retrieval_failure",
                     success=False,
                     payload={
-                        "reason": str(fallback_debug.get("reason") or "no_chunks")[:200],
+                        "reason": str(fallback_debug.get("reason") or outcome)[:200],
+                        "retrieval_outcome": outcome,
                         "mode": mode,
                         "top_k": top_k,
+                        "filters_relaxed": bool(fallback_debug.get("filters_relaxed")),
                     },
                 )
             except Exception:  # noqa: BLE001
                 pass
         return {
-            "answer": INSUFFICIENT_CONTEXT_ANSWER,
+            "answer": user_answer,
             "sources": [],
-            "debug": prepared["fallback_debug"],
+            "debug": fallback_debug,
         }
 
     raw_answer = generate_grounded_answer(
@@ -1597,6 +1758,24 @@ def answer_question(
     )
 
     history_used = bool(conversation_history)
+    retrieval_diag = prepared.get("retrieval") or _build_retrieval_diagnostics(
+        outcome=OUTCOME_OK,
+        chunks_returned=prepared["chunks_count"],
+        chunks_filtered_out=prepared["filtered_out"],
+        extractable_count=prepared["chunks_count"],
+        filters_relaxed=bool(prepared.get("filters_relaxed")),
+        filters_applied={},
+        reason="context ready",
+    )
+    # Detect model refusal: context was provided but the LLM emitted the
+    # insufficient-context fallback (or the legacy Slack-worded variant).
+    if is_insufficient_context_answer(finalized["answer"]):
+        retrieval_diag = {
+            **retrieval_diag,
+            "outcome": OUTCOME_LLM_REFUSAL,
+            "reason": "LLM refused despite retrieved context",
+        }
+
     result = {
         "answer": finalized["answer"],
         "sources": finalized["cleaned_sources"],
@@ -1613,6 +1792,9 @@ def answer_question(
             "top_k": top_k,
             "history_used": history_used,
             "history_turns": len(conversation_history) if history_used else 0,
+            "filters_relaxed": bool(prepared.get("filters_relaxed")),
+            "retrieval_outcome": retrieval_diag.get("outcome", OUTCOME_OK),
+            "retrieval": retrieval_diag,
         },
     }
 

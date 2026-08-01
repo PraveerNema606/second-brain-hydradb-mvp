@@ -7,12 +7,62 @@ question style. All modes share the same hard rules:
   - Cite sources as [1], [2], ...
   - If the context is insufficient, return the exact fallback string.
 
-Backward compatible: "default" reproduces the original prompt.
+Backward compatible: "default" reproduces the original prompt shape
+(with connector-agnostic wording).
 """
 
-# The canonical fallback string is mirrored here so prompts.py doesn't
-# need to import from llm.py.
-INSUFFICIENT_CONTEXT_ANSWER = "I do not have enough Slack context to answer that."
+# Canonical fallback when the model (or empty-context short-circuit)
+# cannot answer from retrieved snippets. Connector-agnostic on purpose:
+# context may come from Slack, Gmail, or structured memory.
+INSUFFICIENT_CONTEXT_ANSWER = "I do not have enough context to answer that."
+
+# Pre-Phase-2 string. Still recognized so cached / in-flight model
+# replies and older clients are classified as refusals correctly.
+LEGACY_INSUFFICIENT_CONTEXT_ANSWER = (
+    "I do not have enough Slack context to answer that."
+)
+
+# Machine-readable retrieval / answer outcomes surfaced in debug.
+OUTCOME_OK = "ok"
+OUTCOME_EMPTY_CORPUS = "empty_corpus"
+OUTCOME_NO_USABLE_TEXT = "no_usable_text"
+OUTCOME_FILTERED_OUT = "filtered_out"
+OUTCOME_LLM_REFUSAL = "llm_refusal"
+
+# User-facing copy for retrieval failures (LLM refusal keeps the
+# canonical short string so the model contract stays one exact line).
+_OUTCOME_ANSWERS = {
+    OUTCOME_EMPTY_CORPUS: (
+        "I do not have enough context to answer that. "
+        "No matching documents were found — if you recently ingested, "
+        "indexing may still be in progress; try again shortly."
+    ),
+    OUTCOME_NO_USABLE_TEXT: (
+        "I do not have enough context to answer that. "
+        "Documents were returned but no usable text could be extracted."
+    ),
+    OUTCOME_FILTERED_OUT: (
+        "I do not have enough context to answer that. "
+        "Matching documents were found but none survived the applied filters."
+    ),
+    OUTCOME_LLM_REFUSAL: INSUFFICIENT_CONTEXT_ANSWER,
+}
+
+
+def is_insufficient_context_answer(text: str) -> bool:
+    """True if `text` is the canonical or legacy insufficient-context reply."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if t in (INSUFFICIENT_CONTEXT_ANSWER, LEGACY_INSUFFICIENT_CONTEXT_ANSWER):
+        return True
+    # Outcome-specific user messages all start with the canonical prefix.
+    return t.startswith(INSUFFICIENT_CONTEXT_ANSWER)
+
+
+def answer_for_retrieval_outcome(outcome: str) -> str:
+    """User-facing answer string for a failed retrieval outcome."""
+    return _OUTCOME_ANSWERS.get(outcome, INSUFFICIENT_CONTEXT_ANSWER)
 
 
 SUPPORTED_MODES = (
@@ -40,8 +90,9 @@ _HARD_RULES = f"""Rules:
 
 _BASE_PROMPT = (
     "You are the Second Brain assistant. You answer questions about the "
-    "user's Slack workspace using ONLY the numbered context snippets "
-    "provided below the user's question.\n\n"
+    "user's workspace communications (Slack messages/threads and Gmail "
+    "emails) using ONLY the numbered context snippets provided below the "
+    "user's question.\n\n"
 )
 
 
@@ -49,14 +100,14 @@ _BASE_PROMPT = (
 _MODE_BODIES = {
     "default": ("Be concise. Prefer short, direct answers over restating the context."),
     "summary": (
-        "Summarize the relevant Slack context into a short briefing.\n"
+        "Summarize the relevant context into a short briefing.\n"
         "- 3 to 6 bullet points.\n"
         "- Each bullet is one sentence, in the user's words where possible.\n"
         "- Cite the source for every bullet.\n"
         "- Do not include greetings, sign-offs, or filler."
     ),
     "decisions": (
-        "Extract only DECISIONS that were made in the Slack context.\n"
+        "Extract only DECISIONS that were made in the provided context.\n"
         "- A decision is an explicit choice, conclusion, or commitment.\n"
         "- List each decision as a single line, prefixed with '- '.\n"
         "- Cite the source for each decision.\n"
