@@ -74,6 +74,7 @@ def _non_slack_chunk(*, text, source_id, ts=None):
 def _call(question, top_k=5, **kwargs):
     from recall import prepare_recall_context
 
+    kwargs.setdefault("hydradb_sub_tenant_id", "ws_testtenant")
     return prepare_recall_context(question, top_k, **kwargs)
 
 

@@ -175,7 +175,14 @@ class HydraHealthCheck(HealthCheck):
             )
 
         base_url = os.getenv("HYDRADB_BASE_URL", "https://api.hydradb.com").rstrip("/")
-        sub_tenant_id = os.getenv("HYDRADB_SUB_TENANT_ID", "slack-second-brain")
+        # No hard-coded default tenant — readiness must use an explicitly
+        # configured probe sub-tenant (typically HYDRADB_SUB_TENANT_ID).
+        sub_tenant_id = (os.getenv("HYDRADB_SUB_TENANT_ID") or "").strip()
+        if not sub_tenant_id:
+            return HealthResult(
+                status=STATUS_ERROR,
+                message="HYDRADB_SUB_TENANT_ID not configured",
+            )
         url = f"{base_url}/recall/full_recall"
         headers = {
             "Authorization": f"Bearer {api_key}",

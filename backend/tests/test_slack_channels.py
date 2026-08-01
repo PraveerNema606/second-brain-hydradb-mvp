@@ -201,7 +201,7 @@ class TestRunIngest:
             # Phase 4: the route resolves the workspace's HydraDB
             # sub-tenant before scheduling the runner. Patch this so
             # the test doesn't hit Supabase.
-            "main.ensure_workspace_sub_tenant",
+            "main.require_workspace_sub_tenant",
             return_value="ws_test_abc",
         ), patch(
             "main.run_workspace_ingest",
@@ -251,9 +251,11 @@ class TestRunIngest:
         client,
         jwt_auth_headers,
     ):
-        # Phase 4: if ensure_workspace_sub_tenant returns None we
-        # refuse rather than fall back to the env default -- that
+        # Phase 4: if require_workspace_sub_tenant fails we refuse
+        # rather than fall back to the env default -- that
         # would leak data into the shared HydraDB bucket.
+        from errors import WorkspaceTenantError
+
         with patch(
             "main.get_slack_installation",
             return_value={"bot_token": "xoxb-test"},
@@ -261,8 +263,8 @@ class TestRunIngest:
             "main.list_selected_channel_ids",
             return_value=["C1"],
         ), patch(
-            "main.ensure_workspace_sub_tenant",
-            return_value=None,
+            "main.require_workspace_sub_tenant",
+            side_effect=WorkspaceTenantError(),
         ), patch(
             "main.run_workspace_ingest",
         ) as mock_runner:

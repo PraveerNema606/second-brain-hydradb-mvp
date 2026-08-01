@@ -502,6 +502,7 @@ class TestMemoryAwareRetrieval:
                 "what was decided about deployment",
                 top_k=5,
                 workspace_id=WS1,
+                hydradb_sub_tenant_id="ws_testtenant",
             )
         assert result["ready"] is True
         # The memory surfaced as a source.
@@ -527,6 +528,7 @@ class TestMemoryAwareRetrieval:
             prepare_recall_context(
                 "what was decided",
                 top_k=5,
+                hydradb_sub_tenant_id="ws_testtenant",
                 # workspace_id deliberately omitted
             )
         mock_list.assert_not_called()
@@ -550,6 +552,7 @@ class TestMemoryAwareRetrieval:
                 "what is the latest message",
                 top_k=5,
                 workspace_id=WS1,
+                hydradb_sub_tenant_id="ws_testtenant",
             )
         mock_list.assert_not_called()
 
@@ -591,6 +594,7 @@ class TestMemoryAwareRetrieval:
                 top_k=5,
                 workspace_id=WS1,
                 allowed_sources=["gmail"],
+                hydradb_sub_tenant_id="ws_testtenant",
             )
         kinds = [(s.get("source_kind"), s.get("memory_kind")) for s in result["sources"]]
         # Slack memory must be excluded.
@@ -621,6 +625,7 @@ class TestMemoryAwareRetrieval:
                 "kafka",
                 top_k=5,
                 workspace_id=WS1,
+                hydradb_sub_tenant_id="ws_testtenant",
             )
         # We still got a real answer; the memory layer degraded silently.
         assert result["ready"] is True

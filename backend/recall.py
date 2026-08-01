@@ -21,7 +21,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from hydradb_client import HydraDBClient
+from hydradb_client import HydraDBClient, require_sub_tenant_id
 from ingestion.ingestion_state import IngestionState
 from llm import generate_grounded_answer
 from logging_config import get_logger
@@ -1090,12 +1090,16 @@ def prepare_recall_context(
         rerank_chunks,
     )
 
-    # Phase 4: workspace-isolated HydraDB. When a caller passes a
-    # sub-tenant id we use it explicitly; otherwise the client falls
-    # back to its env default (HYDRADB_SUB_TENANT_ID) — that path is
-    # only used by the legacy CLI ingestion + the existing test
-    # mocks, never by user-facing routes.
-    hydra = HydraDBClient(sub_tenant_id=hydradb_sub_tenant_id) if hydradb_sub_tenant_id else HydraDBClient()
+    # Phase 4: workspace-isolated HydraDB. Fail closed when no
+    # sub-tenant is provided — never fall back to HYDRADB_SUB_TENANT_ID
+    # / a hard-coded default (that would search the wrong corpus or
+    # leak across workspaces). User-facing routes must call
+    # ensure_workspace_sub_tenant first and pass the result here.
+    sub_tenant = require_sub_tenant_id(
+        hydradb_sub_tenant_id,
+        context="prepare_recall_context",
+    )
+    hydra = HydraDBClient(sub_tenant_id=sub_tenant)
 
     # Normalize the allowed_sources whitelist. Input shapes we accept:
     #   None                      -> all sources allowed (default)
@@ -1129,7 +1133,7 @@ def prepare_recall_context(
         "recall_corpus_probe",
         extra={
             "workspace_id": workspace_id,
-            "sub_tenant": hydradb_sub_tenant_id,
+            "sub_tenant": sub_tenant,
             "chunks_returned": len(chunks),
         },
     )

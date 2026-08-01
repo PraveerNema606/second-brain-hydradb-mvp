@@ -2146,7 +2146,10 @@ def run_workspace_gmail_ingest(
         duration_ms, refresh_token_used, incremental_label_count,
         full_label_count, invalidations.
 
-    Behavior unchanged from Phase 8:
+    Behavior unchanged from Phase 8 / Phase 4 fail-closed tenancy:
+      - `hydradb_sub_tenant_id` is REQUIRED. Missing/blank values refuse
+        the run (dead-letter + error summary) — never fall back to an
+        env / hard-coded HydraDB tenant.
       - Per-run cap (GMAIL_MAX_MESSAGES_PER_RUN) is shared across labels.
       - SPAM/TRASH labels skipped unless GMAIL_ALLOW_SPAM_TRASH=true.
       - Per-label permanent errors emit dead_letter and continue.
@@ -2157,7 +2160,8 @@ def run_workspace_gmail_ingest(
     """
     import time as _time  # noqa: PLC0415
 
-    from hydradb_client import HydraDBClient  # noqa: PLC0415
+    from hydradb_client import HydraDBClient, require_sub_tenant_id  # noqa: PLC0415
+    from errors import WorkspaceTenantError  # noqa: PLC0415
     from supabase_client import (  # noqa: PLC0415
         get_gmail_ingestion_state_map,
         update_gmail_connection_tokens,
@@ -2214,14 +2218,30 @@ def run_workspace_gmail_ingest(
     cap_total = max(1, int(cap_total))
     allow_spam_trash = os.getenv("GMAIL_ALLOW_SPAM_TRASH", "").strip().lower() in ("1", "true", "yes", "on")
 
-    if hydradb_sub_tenant_id:
-        hydra = HydraDBClient(sub_tenant_id=hydradb_sub_tenant_id)
-    else:
-        logger.warning(
+    # Fail closed: sub-tenant is REQUIRED. Never fall back to the env /
+    # hard-coded HydraDB tenant (cross-workspace leak).
+    try:
+        sub_tenant = require_sub_tenant_id(
+            hydradb_sub_tenant_id,
+            context=f"run_workspace_gmail_ingest workspace_id={workspace_id}",
+        )
+    except WorkspaceTenantError:
+        logger.error(
             "gmail_ingest_no_sub_tenant",
             extra={"workspace_id": workspace_id},
         )
-        hydra = HydraDBClient()
+        emit_dead_letter(
+            kind="gmail_ingest",
+            workspace_id=workspace_id,
+            error=RuntimeError("missing_sub_tenant"),
+            context={"connection_id": connection.get("id")},
+        )
+        summary["labels_failed"] = len(label_ids)
+        summary["sync_finished_at"] = datetime.now(timezone.utc).isoformat()
+        summary["error"] = "missing_sub_tenant"
+        return summary
+
+    hydra = HydraDBClient(sub_tenant_id=sub_tenant)
 
     connection_id = connection.get("id")
     connection_email = (connection.get("email") or "").strip()

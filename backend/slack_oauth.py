@@ -303,30 +303,44 @@ def run_workspace_ingest(
     Run a synchronous ingestion pass for one workspace's selected
     channels. Returns a small stats dict.
 
-    Phase 4: when `hydradb_sub_tenant_id` is provided we route all
-    HydraDB uploads to that sub-tenant so workspaces are isolated.
-    When omitted (legacy CLI path / older tests) we fall back to the
-    HYDRADB_SUB_TENANT_ID env default. The /api/slack/ingest route
-    resolves the workspace's sub-tenant via ensure_workspace_sub_tenant
-    before scheduling this runner.
+    Phase 4: `hydradb_sub_tenant_id` is REQUIRED. Callers (API route,
+    scheduler) must resolve it via ensure_workspace_sub_tenant first.
+    Missing/blank values refuse the run — we never fall back to an
+    env / hard-coded HydraDB tenant (that would leak workspace data).
 
     Synchronous on purpose: the caller wires this into a FastAPI
     BackgroundTask so the request returns immediately and the run
     proceeds in the worker. If anything raises, we log and return a
     failure dict — never propagate to the caller.
     """
+    empty = {
+        "channels_processed": 0,
+        "files_prepared": 0,
+        "successes": 0,
+        "failures": 0,
+        "skipped": 0,
+    }
     if not bot_token or not channel_ids:
-        return {
-            "channels_processed": 0,
-            "files_prepared": 0,
-            "successes": 0,
-            "failures": 0,
-            "skipped": 0,
-        }
+        return empty
+
+    # Fail closed before constructing HydraDBClient.
+    from hydradb_client import HydraDBClient, require_sub_tenant_id  # noqa: PLC0415
+    from errors import WorkspaceTenantError  # noqa: PLC0415
+
+    try:
+        sub_tenant = require_sub_tenant_id(
+            hydradb_sub_tenant_id,
+            context=f"run_workspace_ingest workspace_id={workspace_id}",
+        )
+    except WorkspaceTenantError:
+        logger.error(
+            "workspace_ingest_no_sub_tenant",
+            extra={"workspace_id": workspace_id},
+        )
+        return {**empty, "failures": 1, "error": "missing_sub_tenant"}
 
     # Lazy imports so a missing slack_sdk dep at startup doesn't tank
     # the whole module (and so the test suite can monkeypatch).
-    from hydradb_client import HydraDBClient
     from ingestion.ingest_slack import (
         STATE_PATH,
         process_channel,
@@ -336,18 +350,7 @@ def run_workspace_ingest(
     from ingestion.slack_client import SlackClientWrapper
 
     slack = SlackClientWrapper(token=bot_token)
-    # Phase 4: route uploads to the workspace's HydraDB sub-tenant.
-    # Falling back to the env default would silently leak this
-    # workspace's documents into another tenant — surface that as a
-    # log warning so an operator can see the misconfiguration.
-    if hydradb_sub_tenant_id:
-        hydra = HydraDBClient(sub_tenant_id=hydradb_sub_tenant_id)
-    else:
-        logger.warning(
-            "workspace_ingest_no_sub_tenant",
-            extra={"workspace_id": workspace_id},
-        )
-        hydra = HydraDBClient()
+    hydra = HydraDBClient(sub_tenant_id=sub_tenant)
     state = IngestionState(STATE_PATH)
 
     total_files = 0

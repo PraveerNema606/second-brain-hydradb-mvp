@@ -455,7 +455,7 @@ class TestRunIngest:
             "main.list_selected_gmail_label_ids",
             return_value=["INBOX", "Label_5"],
         ), patch(
-            "main.ensure_workspace_sub_tenant",
+            "main.require_workspace_sub_tenant",
             return_value="ws_test_abc",
         ), patch(
             "main.run_workspace_gmail_ingest",
@@ -506,6 +506,8 @@ class TestRunIngest:
         client,
         jwt_auth_headers,
     ):
+        from errors import WorkspaceTenantError
+
         with patch(
             "main.get_gmail_connection",
             return_value={"id": "conn-1"},
@@ -513,8 +515,8 @@ class TestRunIngest:
             "main.list_selected_gmail_label_ids",
             return_value=["INBOX"],
         ), patch(
-            "main.ensure_workspace_sub_tenant",
-            return_value=None,
+            "main.require_workspace_sub_tenant",
+            side_effect=WorkspaceTenantError(),
         ), patch(
             "main.run_workspace_gmail_ingest",
         ) as mock_runner:

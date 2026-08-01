@@ -171,7 +171,7 @@ class TestSubTenantRouting:
             "main.list_selected_gmail_label_ids",
             return_value=["INBOX"],
         ), patch(
-            "main.ensure_workspace_sub_tenant",
+            "main.require_workspace_sub_tenant",
             return_value="ws_aaaaaaaaaaaa",
         ) as mock_ensure, patch(
             "main.run_workspace_gmail_ingest",
@@ -199,6 +199,8 @@ class TestSubTenantRouting:
         """If we can't resolve the workspace's sub-tenant, we refuse
         the ingest with 502 -- we MUST NOT fall back to the env-default
         sub-tenant, which would leak emails into the shared bucket."""
+        from errors import WorkspaceTenantError
+
         with patch(
             "main.get_gmail_connection",
             return_value={"id": "conn-1", "workspace_id": WORKSPACE_A, "refresh_token": "rt"},
@@ -206,8 +208,8 @@ class TestSubTenantRouting:
             "main.list_selected_gmail_label_ids",
             return_value=["INBOX"],
         ), patch(
-            "main.ensure_workspace_sub_tenant",
-            return_value=None,
+            "main.require_workspace_sub_tenant",
+            side_effect=WorkspaceTenantError(),
         ), patch(
             "main.run_workspace_gmail_ingest",
         ) as mock_runner:

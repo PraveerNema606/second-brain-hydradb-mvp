@@ -536,24 +536,22 @@ class TestRunWorkspaceGmailIngest:
             )
         mock_hydra.assert_called_once_with(sub_tenant_id="ws_test_abc")
 
-    def test_missing_sub_tenant_falls_back_to_default(self):
+    def test_missing_sub_tenant_refuses(self):
         from gmail_oauth import run_workspace_gmail_ingest
 
         with patch(
-            "gmail_oauth.list_thread_ids_for_label",
-            return_value=[],
-        ), patch(
             "hydradb_client.HydraDBClient",
         ) as mock_hydra, patch(
-            "supabase_client.upsert_gmail_ingestion_state",
-            return_value=True,
-        ):
-            run_workspace_gmail_ingest(
+            "gmail_oauth.emit_dead_letter",
+        ) as mock_dl:
+            stats = run_workspace_gmail_ingest(
                 workspace_id="ws-1",
                 connection=self._connection(),
                 label_ids=["INBOX"],
             )
-        mock_hydra.assert_called_once_with()
+        mock_hydra.assert_not_called()
+        mock_dl.assert_called_once()
+        assert stats.get("error") == "missing_sub_tenant"
 
     def test_no_labels_returns_zero_counts(self):
         from gmail_oauth import run_workspace_gmail_ingest

@@ -134,7 +134,6 @@ from supabase_client import (  # noqa: E402
     create_share_link,
     delete_gmail_connection,
     delete_saved_answer,
-    ensure_workspace_sub_tenant,
     get_gmail_connection,
     get_gmail_connection_public,
     get_gmail_connection_sync_summary,
@@ -151,6 +150,7 @@ from supabase_client import (  # noqa: E402
     list_share_links_for_workspace,
     list_user_workspaces,
     list_workspace_channels,
+    require_workspace_sub_tenant,
     revoke_share_link,
     set_selected_channels,
     set_selected_gmail_labels,
@@ -695,6 +695,13 @@ def query(
                 debug["query_rewrite"] = rewrite["rewrite_debug"]
             return {**intel_result, "debug": debug}
 
+    # Phase 4: fail closed if the workspace HydraDB sub-tenant cannot
+    # be resolved. Never pass None into recall (that used to fall back
+    # to the env default tenant).
+    sub_tenant = require_workspace_sub_tenant(
+        workspace_id=workspace.workspace_id,
+    )
+
     result = answer_question(
         question=req.question,
         top_k=req.top_k,
@@ -716,13 +723,7 @@ def query(
         # pull matching structured memories (action items / decisions
         # / summaries / entities) alongside the HydraDB chunks.
         workspace_id=workspace.workspace_id,
-        # Phase 4: route this query to the workspace's HydraDB
-        # sub-tenant. ensure_workspace_sub_tenant materializes the row
-        # value on the fly for any pre-Phase-4 workspace that missed
-        # the migration backfill.
-        hydradb_sub_tenant_id=ensure_workspace_sub_tenant(
-            workspace_id=workspace.workspace_id,
-        ),
+        hydradb_sub_tenant_id=sub_tenant,
     )
 
     # Mark non-cached on the way out so the UI can render a "fresh" badge
@@ -797,6 +798,12 @@ def query_stream(
     date_query_debug = resolved["date_query_debug"]
     rewrite_debug = rewrite["rewrite_debug"]
 
+    # Fail closed before opening the SSE stream — same contract as
+    # /api/query and the ingest routes.
+    sub_tenant = require_workspace_sub_tenant(
+        workspace_id=workspace.workspace_id,
+    )
+
     def _generator():
         # If we have a cached result, hand the client the whole answer in
         # one `token` event followed by `done`. The UI renders it the same
@@ -836,10 +843,7 @@ def query_stream(
                 allowed_sources=req.allowed_sources,
                 # Phase 12: workspace_id for structured-memory lookup.
                 workspace_id=workspace.workspace_id,
-                # Phase 4: workspace-isolated recall.
-                hydradb_sub_tenant_id=ensure_workspace_sub_tenant(
-                    workspace_id=workspace.workspace_id,
-                ),
+                hydradb_sub_tenant_id=sub_tenant,
             )
         except AppError as e:
             yield _sse_event(
@@ -1974,18 +1978,11 @@ def slack_ingest(
         )
 
     # Phase 4: resolve (or lazy-create) the workspace's HydraDB
-    # sub-tenant before scheduling the background task. A blank value
-    # here means a DB error occurred — we refuse rather than fall back
-    # to the global sub-tenant, which would leak this workspace's
-    # Slack content into the shared bucket.
-    sub_tenant = ensure_workspace_sub_tenant(
+    # sub-tenant before scheduling the background task. Fail closed —
+    # never fall back to a global / env sub-tenant.
+    sub_tenant = require_workspace_sub_tenant(
         workspace_id=workspace.workspace_id,
     )
-    if not sub_tenant:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Could not resolve workspace HydraDB tenant.",
-        )
 
     background_tasks.add_task(
         run_workspace_ingest,
@@ -2279,17 +2276,11 @@ def gmail_ingest(
         )
 
     # Phase 4-style: resolve (or lazy-create) the workspace's HydraDB
-    # sub-tenant before kicking off. A blank value means a DB error
-    # occurred -- we refuse rather than fall back to the global tenant,
-    # which would leak emails into the shared HydraDB bucket.
-    sub_tenant = ensure_workspace_sub_tenant(
+    # sub-tenant before kicking off. Fail closed — never fall back to
+    # a global / env tenant.
+    sub_tenant = require_workspace_sub_tenant(
         workspace_id=workspace.workspace_id,
     )
-    if not sub_tenant:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Could not resolve workspace HydraDB tenant.",
-        )
 
     background_tasks.add_task(
         run_workspace_gmail_ingest,

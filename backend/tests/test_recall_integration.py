@@ -23,6 +23,7 @@ class TestPrepareRecallContext:
     def _call(self, question="what happened?", top_k=5, mode="default", **kwargs):
         from recall import prepare_recall_context
 
+        kwargs.setdefault("hydradb_sub_tenant_id", "ws_testtenant")
         return prepare_recall_context(question, top_k, mode=mode, **kwargs)
 
     def test_returns_ready_true_when_chunks_found(self):

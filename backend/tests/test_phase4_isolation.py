@@ -113,17 +113,16 @@ class TestRecallUsesWorkspaceSubTenant:
             sub_tenant_id="ws_abcdef012345",
         )
 
-    def test_prepare_recall_context_uses_env_default_when_omitted(self):
-        # Backwards-compat path: legacy CLI / older tests that don't
-        # pass a sub-tenant get the env-default HydraDBClient. The
-        # client is constructed WITHOUT explicit sub_tenant_id kwargs.
+    def test_prepare_recall_context_refuses_when_sub_tenant_omitted(self):
+        # Fail closed: omitting hydradb_sub_tenant_id must NOT fall back
+        # to an env / hard-coded HydraDB tenant.
+        from errors import WorkspaceTenantError
         from recall import prepare_recall_context
 
         with patch("recall.HydraDBClient") as mock_client_cls:
-            instance = mock_client_cls.return_value
-            instance.full_recall.return_value = {"results": []}
-            prepare_recall_context(question="anything", top_k=3)
-        mock_client_cls.assert_called_once_with()
+            with pytest.raises(WorkspaceTenantError):
+                prepare_recall_context(question="anything", top_k=3)
+        mock_client_cls.assert_not_called()
 
     def test_answer_question_forwards_sub_tenant(self):
         """answer_question must thread its hydradb_sub_tenant_id arg
@@ -158,7 +157,7 @@ class TestApiQueryUsesWorkspaceSubTenant:
         the workspace's resolved sub_tenant_id, NOT the env default."""
         # Bypass query rewrite + caching to keep the test focused.
         with patch(
-            "main.ensure_workspace_sub_tenant",
+            "main.require_workspace_sub_tenant",
             return_value="ws_resolved_abc",
         ) as mock_ensure, patch(
             "main.answer_question",
@@ -183,7 +182,7 @@ class TestApiQueryUsesWorkspaceSubTenant:
         # The streaming route exits early when prepare_recall_context
         # returns ready=False, so we can stub it minimally.
         with patch(
-            "main.ensure_workspace_sub_tenant",
+            "main.require_workspace_sub_tenant",
             return_value="ws_resolved_abc",
         ), patch(
             "main.prepare_recall_context",
@@ -230,30 +229,21 @@ class TestRunWorkspaceIngestUsesSubTenant:
             sub_tenant_id="ws_workspace_xx",
         )
 
-    def test_falls_back_to_env_default_when_sub_tenant_missing(self):
-        """When the caller doesn't pass a sub-tenant, the runner logs a
-        warning and uses HydraDBClient() (env default). This path
-        exists for legacy CLI compatibility; the scheduler + API
-        callers never hit it."""
+    def test_refuses_when_sub_tenant_missing(self):
+        """When the caller doesn't pass a sub-tenant, the runner must
+        refuse — never fall back to an env / hard-coded HydraDB tenant."""
         from slack_oauth import run_workspace_ingest
 
-        with patch("slack_oauth.WebClient"), patch("hydradb_client.HydraDBClient") as mock_hydra_cls, patch(
-            "ingestion.slack_client.SlackClientWrapper"
-        ), patch(
-            "ingestion.ingest_slack.process_channel",
-            return_value={"files": [], "newest_ts_seen": None, "channel_id": "C1", "skipped_count": 0},
-        ), patch(
-            "ingestion.ingest_slack.upload_in_batches", return_value={"successes": 0, "failures": 0}
-        ), patch(
-            "ingestion.ingestion_state.IngestionState"
-        ):
-            run_workspace_ingest(
+        with patch("hydradb_client.HydraDBClient") as mock_hydra_cls:
+            result = run_workspace_ingest(
                 workspace_id=TEST_WS_ID,
                 bot_token="xoxb-test",
                 channel_ids=["C1"],
                 # hydradb_sub_tenant_id deliberately omitted
             )
-        mock_hydra_cls.assert_called_once_with()
+        mock_hydra_cls.assert_not_called()
+        assert result.get("error") == "missing_sub_tenant"
+        assert result.get("failures", 0) >= 1
 
     def test_short_circuits_when_no_channels(self):
         """No channel_ids -> no HydraDB client construction at all."""

@@ -61,6 +61,18 @@ class HydraDBError(AppError):
     default_detail = "The knowledge backend is unavailable. Please try again."
 
 
+class WorkspaceTenantError(AppError):
+    """
+    Raised when a workspace-scoped HydraDB operation cannot resolve a
+    hydradb_sub_tenant_id. Callers MUST fail closed — never fall back to
+    the legacy env / default tenant (that would cross workspace data).
+    """
+
+    status_code = 502
+    error_type = "workspace_tenant_error"
+    default_detail = "Could not resolve workspace HydraDB tenant."
+
+
 class LLMError(AppError):
     status_code = 502
     error_type = "llm_error"

@@ -163,6 +163,23 @@ def client(_patched_app):
             yield c
 
 
+@pytest.fixture(autouse=True)
+def stub_workspace_sub_tenant():
+    """
+    Fail-closed tenancy means every /api/query and /api/*/ingest call
+    resolves a HydraDB sub-tenant via require_workspace_sub_tenant.
+    Stub it so the suite never hits live Supabase for that lookup.
+
+    Tests that assert missing-tenant behavior can still override this
+    by nesting their own patch(..., side_effect=WorkspaceTenantError()).
+    """
+    with patch(
+        "main.require_workspace_sub_tenant",
+        return_value="ws_testtenant",
+    ):
+        yield
+
+
 # ── Common header helpers ─────────────────────────────────────────────────
 TEST_API_KEY = "test-secret-key"
 AUTH_HEADERS = {"X-API-Key": TEST_API_KEY}

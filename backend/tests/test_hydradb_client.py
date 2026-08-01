@@ -271,6 +271,7 @@ class TestHydraDBClientInit:
                 base_url="https://hydra.test",
                 api_key=None,
                 tenant_id="tenant",
+                sub_tenant_id="test-sub",
             )
 
     def test_raises_when_tenant_id_missing(self, monkeypatch):
@@ -283,4 +284,19 @@ class TestHydraDBClientInit:
                 base_url="https://hydra.test",
                 api_key="some-key",
                 tenant_id=None,
+                sub_tenant_id="test-sub",
+            )
+
+    def test_raises_when_sub_tenant_missing(self, monkeypatch):
+        """Fail closed: no env / hard-coded default sub-tenant."""
+        monkeypatch.delenv("HYDRADB_SUB_TENANT_ID", raising=False)
+        from errors import WorkspaceTenantError
+        from hydradb_client import HydraDBClient
+
+        with pytest.raises(WorkspaceTenantError):
+            HydraDBClient(
+                base_url="https://hydra.test",
+                api_key="some-key",
+                tenant_id="tenant",
+                sub_tenant_id=None,
             )

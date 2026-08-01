@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from errors import HydraDBError, UpstreamTimeoutError
+from errors import HydraDBError, UpstreamTimeoutError, WorkspaceTenantError
 from logging_config import get_logger
 from retry import RetryExhausted, retry
 
@@ -38,6 +38,27 @@ logger = get_logger(__name__)
 # print a clear hint pointing here whenever the server returns a 4xx.
 # ---------------------------------------------------------------------- #
 RECALL_TOP_K_FIELD = "top_k"
+
+
+def require_sub_tenant_id(
+    sub_tenant_id: Optional[str],
+    *,
+    context: str = "",
+) -> str:
+    """
+    Shared fail-closed gate for every HydraDB access path.
+
+    Returns the stripped sub-tenant id, or raises WorkspaceTenantError
+    when missing/blank. There is intentionally NO fallback to
+    HYDRADB_SUB_TENANT_ID or any hard-coded default — callers must pass
+    the workspace's resolved sub-tenant explicitly.
+    """
+    value = (sub_tenant_id or "").strip()
+    if not value:
+        raise WorkspaceTenantError(
+            log_context=context or "hydradb_sub_tenant_id missing",
+        )
+    return value
 
 
 # Retry-wrapped POST used by upload_knowledge.  Retries on network-level
@@ -158,7 +179,14 @@ class HydraDBClient:
         self.base_url = (base_url or os.getenv("HYDRADB_BASE_URL", "https://api.hydradb.com")).rstrip("/")
         self.api_key = api_key or os.getenv("HYDRADB_API_KEY")
         self.tenant_id = tenant_id or os.getenv("HYDRADB_TENANT_ID")
-        self.sub_tenant_id = sub_tenant_id or os.getenv("HYDRADB_SUB_TENANT_ID", "slack-second-brain")
+        # Fail closed: sub_tenant_id is REQUIRED. No env default and no
+        # hard-coded "slack-second-brain" — those silently mixed workspace
+        # data. Workspace callers pass ensure_workspace_sub_tenant(...);
+        # the legacy CLI must pass HYDRADB_SUB_TENANT_ID explicitly.
+        self.sub_tenant_id = require_sub_tenant_id(
+            sub_tenant_id,
+            context="HydraDBClient.__init__",
+        )
 
         if not self.api_key:
             raise ValueError("HYDRADB_API_KEY is not set.")

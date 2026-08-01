@@ -375,6 +375,7 @@ class TestRecallImportanceWiring:
             "what was decided about deployment",
             top_k=5,
             workspace_id=TEST_WS,
+            hydradb_sub_tenant_id="ws_testtenant",
         )
 
     def test_score_is_importance_scaled_when_scoring_succeeds(self):
@@ -809,6 +810,9 @@ class TestQueryRouteIntegration:
         with patch(
             "memory_intelligence.route_intelligence_query",
             return_value=None,
+        ), patch(
+            "main.require_workspace_sub_tenant",
+            return_value="ws_testtenant",
         ), patch("main.answer_question", return_value=normal) as mock_answer:
             r = client.post(
                 "/api/query",
@@ -824,6 +828,9 @@ class TestQueryRouteIntegration:
         with patch(
             "memory_intelligence.route_intelligence_query",
             side_effect=RuntimeError("boom"),
+        ), patch(
+            "main.require_workspace_sub_tenant",
+            return_value="ws_testtenant",
         ), patch("main.answer_question", return_value=normal):
             r = client.post(
                 "/api/query",
@@ -836,6 +843,9 @@ class TestQueryRouteIntegration:
     def test_history_bypasses_routing(self, client, jwt_auth_headers):
         normal = {"answer": "Follow-up answer.", "sources": [], "debug": {"mode": "default"}}
         with patch("memory_intelligence.route_intelligence_query") as mock_route, patch(
+            "main.require_workspace_sub_tenant",
+            return_value="ws_testtenant",
+        ), patch(
             "main.answer_question", return_value=normal
         ):
             r = client.post(

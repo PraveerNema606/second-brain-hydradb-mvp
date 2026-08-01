@@ -1155,6 +1155,24 @@ def ensure_workspace_sub_tenant(*, workspace_id: str) -> Optional[str]:
     return derived
 
 
+def require_workspace_sub_tenant(*, workspace_id: str) -> str:
+    """
+    Resolve the workspace HydraDB sub-tenant or raise WorkspaceTenantError.
+
+    Shared fail-closed gate for API routes (query + ingest). Never
+    returns a blank value and never falls back to an env / default
+    HydraDB tenant.
+    """
+    from errors import WorkspaceTenantError  # noqa: PLC0415
+
+    value = ensure_workspace_sub_tenant(workspace_id=workspace_id)
+    if not value:
+        raise WorkspaceTenantError(
+            log_context=f"require_workspace_sub_tenant workspace_id={workspace_id}",
+        )
+    return value
+
+
 def mark_workspace_synced(
     *,
     workspace_id: str,

@@ -487,7 +487,14 @@ def main() -> None:
         logger.info('ingest_force_reingest')
 
     slack = SlackClientWrapper()
-    hydra = HydraDBClient()
+    # CLI must pass an explicit sub-tenant. There is no silent default —
+    # set HYDRADB_SUB_TENANT_ID to the workspace's ws_* id (or a dedicated
+    # CLI bucket). Prefer /api/slack/ingest for multi-workspace deploys.
+    cli_sub_tenant = (os.getenv("HYDRADB_SUB_TENANT_ID") or "").strip()
+    if not cli_sub_tenant:
+        logger.error('ingest_no_sub_tenant')
+        sys.exit(1)
+    hydra = HydraDBClient(sub_tenant_id=cli_sub_tenant)
     state = IngestionState(STATE_PATH)
     logger.info(
         'ingest_state_loaded',
